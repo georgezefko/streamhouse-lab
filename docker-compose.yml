@@ -1,0 +1,216 @@
+# Fluss Streamhouse — local stack
+# Layers: hot (Fluss) -> tiering (Flink job) -> cold lakehouse (Iceberg on MinIO, cataloged by Nessie)
+# Versions pinned to Fluss 0.9.1-incubating / Flink 1.20. Do NOT bump Flink to 2.x — the connector is built for 1.20.
+#
+# Bring-up order handled via depends_on/conditions:
+#   minio -> minio-init (creates buckets) -> nessie + fluss servers -> flink
+#
+# NOTE: the Lakehouse Tiering Service is NOT a service here. It is a Flink job you launch
+# with scripts/start-tiering.sh once the stack is healthy (see README, Phase 2).
+#
+# Iceberg plugin jars live in ./lib (run `make jars`). The native Nessie catalog + its deps go
+# BOTH on the Fluss servers (they create the Iceberg tables) AND on Flink (the tiering job writes
+# them). fluss-lake-iceberg is pre-baked into the Fluss image, so the servers don't remount it;
+# Flink has no iceberg at all, so its list adds fluss-lake-iceberg (the LakeStoragePlugin).
+
+# Iceberg deps for the Fluss servers → /opt/fluss/plugins/iceberg/
+x-fluss-iceberg-vols: &fluss-iceberg-vols
+  - ./lib/iceberg-aws-1.10.1.jar:/opt/fluss/plugins/iceberg/iceberg-aws-1.10.1.jar
+  - ./lib/iceberg-aws-bundle-1.10.1.jar:/opt/fluss/plugins/iceberg/iceberg-aws-bundle-1.10.1.jar
+  - ./lib/iceberg-nessie-1.10.1.jar:/opt/fluss/plugins/iceberg/iceberg-nessie-1.10.1.jar
+  - ./lib/nessie-client-0.104.5.jar:/opt/fluss/plugins/iceberg/nessie-client-0.104.5.jar
+  - ./lib/nessie-model-0.104.5.jar:/opt/fluss/plugins/iceberg/nessie-model-0.104.5.jar
+  - ./lib/microprofile-openapi-api-4.1.jar:/opt/fluss/plugins/iceberg/microprofile-openapi-api-4.1.jar
+  - ./lib/jackson-core-2.19.2.jar:/opt/fluss/plugins/iceberg/jackson-core-2.19.2.jar
+  - ./lib/jackson-databind-2.19.2.jar:/opt/fluss/plugins/iceberg/jackson-databind-2.19.2.jar
+  - ./lib/jackson-annotations-2.19.2.jar:/opt/fluss/plugins/iceberg/jackson-annotations-2.19.2.jar
+
+# Same deps for the Flink tiering job → /opt/flink/lib/  (+ the LakeStoragePlugin the image lacks)
+x-flink-iceberg-vols: &flink-iceberg-vols
+  - ./lib/fluss-lake-iceberg-0.9.1-incubating.jar:/opt/flink/lib/fluss-lake-iceberg-0.9.1-incubating.jar
+  - ./lib/iceberg-aws-1.10.1.jar:/opt/flink/lib/iceberg-aws-1.10.1.jar
+  - ./lib/iceberg-aws-bundle-1.10.1.jar:/opt/flink/lib/iceberg-aws-bundle-1.10.1.jar
+  - ./lib/iceberg-nessie-1.10.1.jar:/opt/flink/lib/iceberg-nessie-1.10.1.jar
+  - ./lib/nessie-client-0.104.5.jar:/opt/flink/lib/nessie-client-0.104.5.jar
+  - ./lib/nessie-model-0.104.5.jar:/opt/flink/lib/nessie-model-0.104.5.jar
+  - ./lib/microprofile-openapi-api-4.1.jar:/opt/flink/lib/microprofile-openapi-api-4.1.jar
+  - ./lib/jackson-core-2.19.2.jar:/opt/flink/lib/jackson-core-2.19.2.jar
+  - ./lib/jackson-databind-2.19.2.jar:/opt/flink/lib/jackson-databind-2.19.2.jar
+  - ./lib/jackson-annotations-2.19.2.jar:/opt/flink/lib/jackson-annotations-2.19.2.jar
+  - ./lib/hadoop-client-api-3.3.6.jar:/opt/flink/lib/hadoop-client-api-3.3.6.jar
+  - ./lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar
+  - ./lib/failsafe-3.3.2.jar:/opt/flink/lib/failsafe-3.3.2.jar
+
+services:
+
+  # ---------- Object storage (hot remote data + cold Iceberg warehouse) ----------
+  minio:
+    image: quay.io/minio/minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console (admin/password)
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set minio http://minio:9000 admin password; do
+        echo 'Waiting for MinIO...'; sleep 1;
+      done;
+      mc mb --ignore-existing minio/fluss;
+      mc mb --ignore-existing minio/warehouse;
+      echo 'Buckets ready: fluss (hot remote), warehouse (cold iceberg)';
+      "
+
+  # ---------- Nessie: Iceberg REST catalog with credential vending to MinIO ----------
+  # Iceberg REST endpoint: http://nessie:19120/iceberg/main  (main branch)
+  # version.store IN_MEMORY = branch state is LOST on restart. Swap to ROCKSDB (see README) if you
+  # want git-branch lifecycle demos to survive `docker compose down`.
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.108.2
+    ports:
+      - "19120:19120"
+    environment:
+      - nessie.version.store.type=IN_MEMORY
+      - nessie.catalog.default-warehouse=warehouse
+      - nessie.catalog.warehouses.warehouse.location=s3://warehouse/
+      - nessie.catalog.service.s3.default-options.region=us-east-1
+      - nessie.catalog.service.s3.default-options.path-style-access=true
+      - nessie.catalog.service.s3.default-options.endpoint=http://minio:9000/
+      - nessie.catalog.service.s3.default-options.auth-type=STATIC
+      - nessie.catalog.service.s3.default-options.access-key=urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      - nessie.catalog.secrets.access-key.name=admin
+      - nessie.catalog.secrets.access-key.secret=password
+      - nessie.server.authentication.enabled=false
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  # ---------- Fluss coordination ----------
+  zookeeper:
+    image: zookeeper:3.9.2
+    restart: always
+
+  # ---------- Fluss cluster (hot tier) ----------
+  coordinator-server:
+    image: apache/fluss:0.9.1-incubating
+    command: coordinatorServer
+    # ponytail: restart on boot race — Nessie (slow Quarkus boot) may not be serving :19120 yet
+    # when Fluss inits the Iceberg REST catalog. depends_on only waits for container start, not
+    # app-ready, so the first attempt can hit connection-refused; on-failure retries until ready.
+    restart: on-failure
+    depends_on:
+      zookeeper:
+        condition: service_started
+      nessie:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://coordinator-server:9123
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://minio:9000
+        s3.access-key: admin
+        s3.secret-key: password
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/minio
+        s3.assumed.role.sts.endpoint: http://minio:9000
+        datalake.format: iceberg
+        datalake.iceberg.catalog-impl: org.apache.iceberg.nessie.NessieCatalog
+        datalake.iceberg.uri: http://nessie:19120/api/v2
+        datalake.iceberg.ref: main
+        datalake.iceberg.warehouse: s3://warehouse/
+        datalake.iceberg.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+        datalake.iceberg.s3.endpoint: http://minio:9000
+        datalake.iceberg.s3.access-key-id: admin
+        datalake.iceberg.s3.secret-access-key: password
+        datalake.iceberg.s3.path-style-access: true
+        datalake.iceberg.client.region: us-east-1
+    volumes: *fluss-iceberg-vols
+
+  tablet-server:
+    image: apache/fluss:0.9.1-incubating
+    command: tabletServer
+    restart: on-failure   # ponytail: same boot-race safety net as coordinator-server
+    depends_on:
+      - coordinator-server
+    environment:
+      - |
+        FLUSS_PROPERTIES=
+        zookeeper.address: zookeeper:2181
+        bind.listeners: FLUSS://tablet-server:9123
+        data.dir: /tmp/fluss/data
+        remote.data.dir: s3://fluss/remote-data
+        s3.endpoint: http://minio:9000
+        s3.access-key: admin
+        s3.secret-key: password
+        s3.region: us-east-1
+        s3.path-style-access: true
+        s3.assumed.role.arn: arn:aws:iam::000000000000:role/minio
+        s3.assumed.role.sts.endpoint: http://minio:9000
+        datalake.format: iceberg
+        datalake.iceberg.catalog-impl: org.apache.iceberg.nessie.NessieCatalog
+        datalake.iceberg.uri: http://nessie:19120/api/v2
+        datalake.iceberg.ref: main
+        datalake.iceberg.warehouse: s3://warehouse/
+        datalake.iceberg.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+        datalake.iceberg.s3.endpoint: http://minio:9000
+        datalake.iceberg.s3.access-key-id: admin
+        datalake.iceberg.s3.secret-access-key: password
+        datalake.iceberg.s3.path-style-access: true
+        datalake.iceberg.client.region: us-east-1
+    volumes: *fluss-iceberg-vols
+
+  # ---------- Flink (compute + SQL client) ----------
+  # Image bundles the Fluss Flink connector, flink-faker (demo data), and S3 filesystem support.
+  jobmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating
+    ports:
+      - "8083:8081"   # Flink Web UI
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    volumes: *flink-iceberg-vols
+
+  taskmanager:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating
+    depends_on:
+      - jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 10
+        taskmanager.memory.process.size: 2048m
+        taskmanager.memory.framework.off-heap.size: 256m
+    volumes: *flink-iceberg-vols
+
+  sql-client:
+    image: apache/fluss-quickstart-flink:1.20-0.9.1-incubating
+    depends_on:
+      - jobmanager
+    command: /opt/sql-client/sql-client
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        rest.address: jobmanager
+    volumes: *flink-iceberg-vols   # needed to read datalake `$lake` tables (union read)
+
+volumes:
+  minio-data:

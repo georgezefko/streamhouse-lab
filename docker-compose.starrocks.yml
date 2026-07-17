@@ -1,0 +1,19 @@
+# Phase 3 overlay — StarRocks to query the COLD (tiered Iceberg) data.
+# Usage:  docker compose -f docker-compose.yml -f docker-compose.starrocks.yml up -d starrocks
+#
+# StarRocks reads the Iceberg tables Fluss tiered to MinIO, cataloged by Nessie — it does NOT
+# read Fluss directly. This is the "query stale/cold data with a real OLAP engine" piece.
+# After it's up, register the external catalog with sql/04-starrocks.sql (see README).
+
+services:
+  starrocks:
+    image: starrocks/allin1-ubuntu:latest
+    ports:
+      - "9030:9030"   # MySQL protocol (FE query port) — connect with any mysql client
+      - "8030:8030"   # FE http
+      - "8040:8040"   # BE http
+    healthcheck:
+      test: ["CMD", "mysql", "-h", "127.0.0.1", "-P", "9030", "-u", "root", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10

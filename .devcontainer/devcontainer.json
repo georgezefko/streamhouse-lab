@@ -1,0 +1,18 @@
+{
+  "name": "fluss-streamhouse",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    // Drive the host Docker daemon so `docker compose` runs the stack alongside (not nested in) the devcontainer.
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.12" }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "forwardPorts": [8083, 9000, 9001, 19120, 9030],
+  "portsAttributes": {
+    "8083":  { "label": "Flink UI" },
+    "9001":  { "label": "MinIO console" },
+    "19120": { "label": "Nessie" },
+    "9030":  { "label": "StarRocks (MySQL)" }
+  },
+  "remoteUser": "vscode"
+}
