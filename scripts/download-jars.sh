@@ -60,5 +60,9 @@ done
 download "https://repo1.maven.org/maven2/dev/failsafe/failsafe/3.3.2/failsafe-3.3.2.jar" \
          "failsafe-3.3.2.jar"
 
+# iceberg-flink connector: needed to READ the tiered cold tier via `<table>$lake` in Flink SQL.
+download "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.20/${ICEBERG_VERSION}/iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar" \
+         "iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar"
+
 echo "Done. Jars:"
 ls -1 "$LIB_DIR"

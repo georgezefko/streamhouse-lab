@@ -24,6 +24,7 @@ x-fluss-iceberg-vols: &fluss-iceberg-vols
   - ./lib/jackson-core-2.19.2.jar:/opt/fluss/plugins/iceberg/jackson-core-2.19.2.jar
   - ./lib/jackson-databind-2.19.2.jar:/opt/fluss/plugins/iceberg/jackson-databind-2.19.2.jar
   - ./lib/jackson-annotations-2.19.2.jar:/opt/fluss/plugins/iceberg/jackson-annotations-2.19.2.jar
+  - ./lib/failsafe-3.3.2.jar:/opt/fluss/plugins/iceberg/failsafe-3.3.2.jar   # reads of existing Iceberg metadata need it
 
 # Same deps for the Flink tiering job → /opt/flink/lib/  (+ the LakeStoragePlugin the image lacks)
 x-flink-iceberg-vols: &flink-iceberg-vols
@@ -40,6 +41,7 @@ x-flink-iceberg-vols: &flink-iceberg-vols
   - ./lib/hadoop-client-api-3.3.6.jar:/opt/flink/lib/hadoop-client-api-3.3.6.jar
   - ./lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar
   - ./lib/failsafe-3.3.2.jar:/opt/flink/lib/failsafe-3.3.2.jar
+  - ./lib/iceberg-flink-runtime-1.20-1.10.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.20-1.10.1.jar
 
 services:
 
@@ -70,8 +72,10 @@ services:
       echo 'Buckets ready: fluss (hot remote), warehouse (cold iceberg)';
       "
 
-  # ---------- Nessie: Iceberg REST catalog with credential vending to MinIO ----------
-  # Iceberg REST endpoint: http://nessie:19120/iceberg/main  (main branch)
+  # ---------- Nessie: Iceberg catalog over MinIO ----------
+  # Fluss uses the NATIVE Nessie catalog API at http://nessie:19120/api/v2 (ref=main), NOT the
+  # Iceberg-REST endpoint (/iceberg/main) — REST createTable NPEs with Fluss's Iceberg 1.10 client.
+  # StarRocks (phase 3) still reads via Nessie's REST endpoint; reads are fine, only REST writes NPE.
   # version.store IN_MEMORY = branch state is LOST on restart. Swap to ROCKSDB (see README) if you
   # want git-branch lifecycle demos to survive `docker compose down`.
   nessie:

@@ -46,28 +46,33 @@ not in that path at all.
 ## Ports
 Flink `8083` · MinIO API `9000` / console `9001` (admin/password) · Nessie `19120` · StarRocks `9030`.
  
-## ⚠️ Known risk points (validate these first)
- 
-1. **Fluss tiering against a REST catalog is the unproven seam.** The official Fluss lakehouse
-   quickstart ships with `JdbcCatalog` (Postgres), not `RESTCatalog`. `org.apache.iceberg.rest.RESTCatalog`
-   is a standard Iceberg catalog and *should* load through `datalake.iceberg.catalog-impl`, but this
-   exact Fluss+Nessie path isn't in the docs. **Smoke-test tiering before building anything on it.**
-   If the tiering job fails to init the catalog, fall back to the JDBC catalog to unblock:
-   add a `postgres:17` service and swap the four `datalake.iceberg.*` catalog lines for:
-```
-   datalake.iceberg.catalog-impl: org.apache.iceberg.jdbc.JdbcCatalog
-   datalake.iceberg.uri: jdbc:postgresql://postgres:5432/iceberg
-   datalake.iceberg.jdbc.user: iceberg
-   datalake.iceberg.jdbc.password: iceberg
-```
-   (also mount `postgresql-42.7.4.jar` into the Fluss iceberg plugin dir) — then revisit Nessie.
- 
-2. **Credential vending vs static creds.** Nessie's REST catalog vends down-scoped S3 creds to
-   clients. We *also* pass static MinIO creds to Fluss's `S3FileIO` so writes work regardless. If
-   Nessie enforces request signing and the two paths disagree, align them (either lean fully on
-   vending, or disable signing for local dev).
-3. **Tiering jar filename is version-specific.** `start-tiering.sh` assumes
-   `fluss-flink-tiering-0.9.1-incubating.jar`. If it's not found:
-   `docker compose exec jobmanager ls /opt/flink/opt | grep tiering`.
-4. **Nessie is `IN_MEMORY`** — branch state dies on `docker compose down`. For git-branch lifecycle
-   demos that survive restarts, switch to `nessie.version.store.type=ROCKSDB` with a mounted volume.
+## How the Fluss ⇄ Nessie ⇄ Iceberg seam actually works (validated)
+
+Getting tiering working end-to-end took four non-obvious fixes. All are in the code now; this is
+the map if you touch them.
+
+1. **Use the NATIVE Nessie catalog, not Iceberg-REST.** We use
+   `datalake.iceberg.catalog-impl: org.apache.iceberg.nessie.NessieCatalog` against Nessie's own API
+   (`http://nessie:19120/api/v2`, `ref: main`), **not** `RESTCatalog` against `/iceberg/main`.
+   Nessie's Iceberg-REST `createTable` NPEs with Fluss 0.9.1's Iceberg 1.10 client (it drops the
+   deprecated `lastColumnId`); the native catalog commits via Nessie's git-like API and works.
+2. **The Flink tiering job needs the whole iceberg plugin set on `/opt/flink/lib`.** The Flink image
+   ships **no** iceberg at all. `scripts/download-jars.sh` fetches `fluss-lake-iceberg` (the
+   `LakeStoragePlugin`), `iceberg-nessie` + `nessie-client`/`nessie-model`/jackson/microprofile,
+   `hadoop-client-*` (Fluss's tiering writer requires Hadoop), `failsafe` (iceberg-aws S3 retries),
+   and `iceberg-flink-runtime` (to *read* `$lake`). `docker-compose.yml` mounts them via the
+   `x-flink-iceberg-vols` anchor.
+3. **S3 for local MinIO needs the STS assume-role endpoint set.** Fluss vends S3 delegation tokens
+   to clients via STS; without pointing STS at MinIO it calls real AWS → `403 InvalidClientTokenId`.
+   The Fluss servers set `s3.assumed.role.arn` + `s3.assumed.role.sts.endpoint: http://minio:9000`
+   (matching the official quickstart's RustFS wiring).
+4. **`failsafe` also belongs in the Fluss server plugin dir** — reading an existing Iceberg table's
+   metadata (e.g. `CREATE TABLE IF NOT EXISTS`) needs it server-side, not just on Flink.
+
+### Smaller notes
+- **Tiering jar filename is version-specific.** `start-tiering.sh` assumes
+  `fluss-flink-tiering-0.9.1-incubating.jar`. If missing: `docker compose exec jobmanager ls /opt/flink/opt | grep tiering`.
+- **Nessie is `IN_MEMORY`** — catalog state dies on `docker compose down`. For branch-lifecycle demos
+  that survive restarts, switch to `nessie.version.store.type=ROCKSDB` with a mounted volume.
+- **The Fluss catalog ignores `CREATE TABLE IF NOT EXISTS`** — it still errors if the table exists.
+  Drop-and-recreate, or `CREATE` only once.
