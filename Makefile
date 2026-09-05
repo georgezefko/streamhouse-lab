@@ -1,10 +1,10 @@
-.PHONY: jars up verify down ps logs sql tiering starrocks sr-sql clean
+.PHONY: jars up verify down ps logs sql tiering demo bench starrocks sr-sql clean
 
-# Phase 0 — fetch Fluss server-side Iceberg jars (run once)
+# Setup — fetch Fluss server-side Iceberg jars (run once)
 jars:
 	bash scripts/download-jars.sh
 
-# Phase 1 — hot loop + lakehouse deps (ZK, MinIO, Nessie, Fluss, Flink)
+# Bring-up — hot loop + lakehouse deps (ZK, MinIO, Nessie, Fluss, Flink, Kafka)
 # Runs the liveness gate at the end so a green/red result is the last thing you see.
 up: jars
 	docker compose up -d
@@ -31,17 +31,27 @@ logs:
 sql:
 	docker compose run --rm sql-client
 
-# Phase 2 — start the Fluss -> Iceberg tiering job (after tables exist)
+# Scenario 2 — start the Fluss -> Iceberg tiering job (after tables exist)
 tiering:
 	bash scripts/start-tiering.sh
 
-# Phase 3 — StarRocks over the cold tier
+# Scenario 2 payoff — hot vs cold, side by side. Needs the tiering job already running.
+# `make demo N=12` for more iterations.
+demo:
+	bash scripts/demo.sh $(N)
+
+# Scenario 3 — StarRocks over the cold tier
 starrocks:
 	docker compose -f docker-compose.yml -f docker-compose.starrocks.yml up -d starrocks
 	@echo "StarRocks (MySQL protocol)  mysql -h 127.0.0.1 -P 9030 -u root"
 
 sr-sql:
 	mysql -h 127.0.0.1 -P 9030 -u root
+
+# Scenario 4 — point-lookup cost: Fluss vs Kafka vs Iceberg.
+# Needs sql/05-bench-load.sql running in `make sql` and the tiering job up.
+bench:
+	bash scripts/bench.sh
 
 clean: down
 	rm -f lib/*.jar

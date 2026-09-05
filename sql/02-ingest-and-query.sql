@@ -28,4 +28,4 @@ SELECT snapshot_id, operation FROM datalake_enriched_orders$lake$snapshots;
 
 -- UNION read (hot Fluss + cold Iceberg) — sub-second freshness, the streamhouse payoff:
 SELECT sum(total_price) AS hot_plus_cold FROM datalake_enriched_orders;
--- Re-run the two queries a few times: hot_plus_cold moves faster than cold_only.
+-- For the side-by-side version (and the row-presence contrast), run `make demo` — sql/03-contrast.sql.

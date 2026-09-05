@@ -64,5 +64,9 @@ download "https://repo1.maven.org/maven2/dev/failsafe/failsafe/3.3.2/failsafe-3.
 download "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.20/${ICEBERG_VERSION}/iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar" \
          "iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar"
 
+# Kafka SQL connector: phase 4 only (the Fluss-vs-Kafka point-lookup comparison).
+download "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.4.0-1.20/flink-sql-connector-kafka-3.4.0-1.20.jar" \
+         "flink-sql-connector-kafka-3.4.0-1.20.jar"
+
 echo "Done. Jars:"
 ls -1 "$LIB_DIR"
