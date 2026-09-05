@@ -82,6 +82,11 @@ the Fluss→Iceberg tiering seam, which does not exist until `make tiering`.
 
 **Proves:** PK-table upserts, point lookups and lookup joins, all sub-second.
 
+`fluss_customer` and `fluss_nation` are PK tables — the lookup-join build sides, where the point
+lookups happen. `fluss_order` and `datalake_enriched_orders` are **log tables**: an append-only
+sink cannot consume the changelog a PK table emits in streaming mode, so making the tiered table
+append-only (for union read) forces its source to be append-only too.
+
 ```bash
 make sql        # paste sql/01-tables.sql, then sql/02 §1 and §2
 ```
@@ -96,6 +101,8 @@ make sql        # paste sql/01-tables.sql, then sql/02 §1 and §2
   [Troubleshooting](#troubleshooting--reset).
 - *0 rows, jobs present* — the `EXECUTE STATEMENT SET` job died. Flink UI → the job →
   *Exceptions*.
+- *`Table sink ... doesn't support consuming update and delete changes`* — a PK table is feeding
+  an append-only sink. Both ends of the enrichment INSERT must be log tables.
 
 ## Scenario 2 — streamhouse vs lakehouse
 
@@ -110,19 +117,42 @@ make demo       # `make demo N=12` for more iterations
 `make demo` runs `sql/03-contrast.sql` on a loop and prints:
 
 ```
-hot_plus_cold   cold_only   rows_only_in_hot
-     1204881     1198340               6541
++---------------+-----------+------------------+
+| hot_plus_cold | cold_only | rows_only_in_hot |
++---------------+-----------+------------------+
+|          4920 |      4550 |              370 |
++---------------+-----------+------------------+
 
-newest_order  42317      found_in_cold 0
++-------------------+-------------+---------------+
+| order_only_in_hot | total_price |     cust_name |
++-------------------+-------------+---------------+
+|          63106392 |      289.44 |  Penny Profit |
+|          71016798 |      895.50 | Sam Dayoulpay |
+|          71469616 |      845.82 |    Moe Skeeto |
++-------------------+-------------+---------------+
 ```
 
 **Pass:** `rows_only_in_hot` > 0 on every iteration, `cold_only` advancing in visible ~30 s steps
-(`table.datalake.freshness`), and `found_in_cold` = 0 — the newest order is queryable in the
-streamhouse and simply *not on the Iceberg path yet*.
+(`table.datalake.freshness`), and the second query naming actual orders — those are rows you can
+query in the streamhouse right now that are *not on the Iceberg path yet*.
+
+The second query is an **anti-join against `$lake`**, not `max(order_key)`. The faker generates
+`order_key` at random, so the largest key is not the newest row — it is usually one tiered long
+ago, and a `max()`-based test reports a false negative.
 
 **When it fails:**
 - *`cold_only` stuck at 0* — the tiering job is not running or crashed. Check the Flink UI and
   `make logs`.
+- *`lake records must instance of sorted view`* — the tiered table has a PRIMARY KEY. See
+  [the union-read constraint](#union-read-needs-a-log-table) below.
+- *`Batch mode can only be supported if one lake snapshot exists`* — nothing has been tiered yet.
+  The bare table is not readable in batch at all until the first flush; wait ~30 s after
+  `make tiering`, or check `<table>$lake` first.
+- *`Trying to access closed classloader`* — Hadoop's static `FileSystem` cache pins the user
+  classloader and Flink's leak check trips, intermittently, on repeated SQL sessions. Disabled via
+  `classloader.check-leaked-classloader: false` in `docker-compose.yml`; if you see it again, that
+  setting did not reach the service that threw.
+- *numbers identical between iterations* — the faker source drained; nothing new is arriving.
 - *`rows_only_in_hot` = 0* — the faker source drained. It is finite: `source_order` is 10,000 rows
   at 10/s, so ~16 minutes. Once it drains, tiering catches up completely and the gap closes —
   correct behaviour, but no longer a contrast. Run `make demo` **while `sql/02` is still
@@ -133,6 +163,24 @@ streamhouse and simply *not on the Iceberg path yet*.
 Cancel the tiering job in the Flink UI, then re-run `make demo`. `cold_only` **freezes** while
 `hot_plus_cold` keeps climbing — the lake tier is now visibly a stale copy while the hot tier
 serves. `make tiering` restarts it and the cold number catches up in one jump.
+
+### Union read needs a log table
+
+`datalake_enriched_orders` has **no primary key**, deliberately.
+
+Union read merges the lake snapshot with the Fluss log. On a PK table that merge is a
+*sort-merge*, so Fluss's `LakeSnapshotAndLogSplitScanner` requires the lake reader to implement
+`org.apache.fluss.lake.source.SortedRecordReader`. `fluss-lake-iceberg-0.9.1-incubating` does not
+implement it anywhere — reading the bare table throws:
+
+```
+java.lang.UnsupportedOperationException: lake records must instance of sorted view.
+```
+
+Log tables concatenate rather than merge, so they union-read fine. This is why the tiered table
+is a log table and the PK tables (`fluss_order`, `fluss_customer`, `fluss_nation`) are not
+tiered. Paimon's reader does implement the interface; Iceberg union read on PK tables is a
+post-0.9 roadmap item.
 
 ## Scenario 3 — an external engine reads the cold tier
 
@@ -151,11 +199,7 @@ number from Scenario 2. That gap is the point: StarRocks sees only what tiering 
 - *Catalog registers but no databases* — nothing has been tiered yet. Run Scenario 2 first.
 - *FE not healthy* — StarRocks `allin1` is memory-hungry; check Docker's allocation.
 
-## Scenario 4 — Fluss vs Kafka ⚠ unverified
-
-> **This scenario has not been run end to end.** The code is written and the compose/jar wiring is
-> valid, but the numbers below show shape, not measured values. Known risks are listed at the
-> bottom — check them on a first real run.
+## Scenario 4 — Fluss vs Kafka
 
 **Proves:** the queryability claim. A Kafka topic and a Fluss table hold the same volume of orders
 over the same key space. Asking one question of each costs wildly different amounts.
@@ -173,33 +217,40 @@ make bench      # third shell
 then runs `sql/06-bench-query.sql` — *"what is order 424242?"* — three times:
 
 ```
-engine                           state       duration
-Fluss  (PK point lookup)         FINISHED         ... ms
-Kafka  (scan to latest offset)   FINISHED         ... ms
-Iceberg (cold Parquet scan)      FINISHED         ... ms
+engine                           state        duration
+Fluss (PK point lookup)          FINISHED        335 ms
+Kafka (scan to latest offset)    FINISHED       2312 ms
 ```
 
-**Pass:** run `make bench` twice, a minute apart. The Fluss row stays **flat** while the Kafka row
-**grows**. That divergence is the whole argument — absolute numbers are laptop-bound and not
-interesting.
+Measured on a 2M-row table/topic on a laptop. The Fluss leg is flat across repeated runs
+(335 / 336 / 313 ms) and is close to Flink's bare job-startup cost — while Kafka spends ~1.7-2.3 s
+deserializing the same 2M records to find one. If Fluss were scanning rather than looking up, the
+two would be in the same ballpark; they are not.
+
+**Pass:** run `make bench` two or three times, a minute apart, **while `sql/05` is still loading**.
+The Fluss row stays flat while the Kafka row grows with the topic. That divergence is the whole
+argument — absolute numbers are laptop-bound and not interesting.
+
+Bench a *drained* topic and both numbers just sit still: there is nothing left to grow. `sql/05`
+loads 20M rows at 20k/s (~17 min) to give you a window wide enough to see it.
 
 - **Fluss** has a primary-key index. A full-PK predicate is a point lookup, and its cost does not
   move as the table grows.
 - **Kafka** has offsets, not indexes. Flink deserializes every record from earliest to latest
   offset (`scan.bounded.mode`), so cost is linear in retention. Kafka+Iceberg gets you a queryable
   copy only by *making a second copy*.
-- **Iceberg** prunes by file and row group, so it beats the topic scan — but sees only flushed
-  rows. Scenario 2's staleness, now with a price tag.
+
+`bench_order` is a PK table but is **not** tiered — the point is to price a pure hot-tier lookup,
+and a tiered PK table cannot be union-read at all (see above). Scenario 2 already prices the cold
+tier.
 
 Timings are Flink job durations pulled from the REST API, not wall clock: `docker compose run`
 costs several seconds of container startup that would swamp everything being measured.
 
-**Known risks on a first run:**
-1. Fluss may not push the full-PK predicate down to a point lookup in batch mode. If it full-scans
-   instead, the headline number vanishes and the query needs rewriting as a lookup join.
-2. The tiering job may not pick up `bench_order` if the table was created after the job started —
-   restart it with `make tiering`.
-3. The flink-faker expression quoting in `sql/05` (doubled single quotes) is untested.
+**Note on `sql/05`:** every `CREATE TEMPORARY TABLE` in it is catalog-qualified on purpose. An
+unqualified `CREATE` lands in whatever catalog is current, so pasting it after `sql/01` (which ends
+in `USE CATALOG fluss_catalog`) would put the faker source in the wrong place and the statement set
+would not find it.
 
 Kafka is a Scenario-4-only dependency. Nothing else in the stack talks to it, and `verify.sh` does
 not gate on it.
@@ -210,6 +261,30 @@ not gate on it.
 
 **`sql/01` errors on a re-run.** The Fluss catalog ignores `CREATE TABLE IF NOT EXISTS` — it still
 errors if the table exists. `DROP TABLE` the ones you need, or do a full reset.
+
+**`Table fluss.<name> already exists` right after a successful `DROP TABLE`.** Dropping a
+datalake-enabled Fluss table removes it from Fluss but **leaves the Iceberg table registered in
+Nessie**, and the recreate fails on that orphan. `SHOW TABLES` in `fluss_catalog` will not list
+it; the Iceberg catalog will. Drop it there — the Iceberg jars are already on the Flink classpath:
+
+```sql
+CREATE CATALOG ice WITH (
+  'type'='iceberg',
+  'catalog-impl'='org.apache.iceberg.nessie.NessieCatalog',
+  'uri'='http://nessie:19120/api/v2',
+  'ref'='main',
+  'warehouse'='s3://warehouse/',
+  'io-impl'='org.apache.iceberg.aws.s3.S3FileIO',
+  's3.endpoint'='http://minio:9000',
+  's3.access-key-id'='admin',
+  's3.secret-access-key'='password',
+  's3.path-style-access'='true',
+  'client.region'='us-east-1'
+);
+USE CATALOG ice;
+SHOW TABLES IN fluss;
+DROP TABLE fluss.<name>;
+```
 
 **Full reset is `make down`** (`docker compose down -v`). This is the *correct* reset, not a heavy
 one: Nessie is `IN_MEMORY`, so its catalog dies with the container regardless, and dropping the
@@ -288,6 +363,15 @@ the map if you touch them.
    metadata (e.g. `CREATE TABLE IF NOT EXISTS`) needs it server-side, not just on Flink.
 
 ### Smaller notes
+- **Iceberg union read is log-tables-only in 0.9.1.** `fluss-lake-iceberg` ships no
+  `SortedRecordReader`, so a tiered PK table cannot be read as hot ∪ cold. See
+  [Union read needs a log table](#union-read-needs-a-log-table).
+- **The bare table is unreadable in batch until the first lake snapshot exists** —
+  `Batch mode can only be supported if one lake snapshot exists for the table`. `$lake` reads
+  return 0 rows in that window; the union read errors.
+- **`sql-client.sh -f` skips the image's init script**, so the pre-baked faker sources
+  (`source_order`, `source_customer`, `source_nation`) do not exist in a `-f` session. Scripted
+  SQL must define its own sources, as `sql/05-bench-load.sql` does.
 - **Tiering jar filename is version-specific.** `start-tiering.sh` assumes
   `fluss-flink-tiering-0.9.1-incubating.jar`. If missing: `docker compose exec jobmanager ls /opt/flink/opt | grep tiering`.
 - **Nessie is `IN_MEMORY`** — catalog state dies on `docker compose down`. For branch-lifecycle demos

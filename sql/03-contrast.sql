@@ -19,8 +19,11 @@ SELECT (SELECT count(*) FROM datalake_enriched_orders)      AS hot_plus_cold,
        (SELECT count(*) FROM datalake_enriched_orders)
      - (SELECT count(*) FROM datalake_enriched_orders$lake) AS rows_only_in_hot;
 
--- 2) The sharper version: one specific order written seconds ago.
---    found_in_cold = 0 — the newest hot row is simply not on the Iceberg path yet.
-SELECT (SELECT max(order_key) FROM datalake_enriched_orders) AS newest_order,
-       (SELECT count(*) FROM datalake_enriched_orders$lake
-          WHERE order_key = (SELECT max(order_key) FROM datalake_enriched_orders)) AS found_in_cold;
+-- 2) The sharper version: name specific orders that the lakehouse path cannot see.
+--    NOT max(order_key) — the faker generates order_key at random, so the largest key is not
+--    the newest row. An anti-join against $lake is the honest test.
+SELECT o.order_key AS order_only_in_hot, o.total_price, o.cust_name
+FROM datalake_enriched_orders o
+LEFT JOIN datalake_enriched_orders$lake l ON o.order_key = l.order_key
+WHERE l.order_key IS NULL
+LIMIT 3;

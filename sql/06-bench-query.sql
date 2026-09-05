@@ -1,7 +1,7 @@
--- Phase 4: the same question asked of three engines.
+-- Scenario 4: the same question asked of two engines.
 --   "What is order 424242?"
 -- Fluss answers it with a primary-key point lookup. Kafka has no index, so Flink reads the
--- topic from earliest to latest offset. Iceberg reads Parquet, and only what was flushed.
+-- topic from earliest to latest offset.
 -- Timings come from the Flink job durations — see scripts/bench.sh.
 
 CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (
@@ -36,7 +36,3 @@ SELECT count(*) AS hits_fluss FROM bench_order WHERE order_key = 424242;
 -- and filtered. Cost is linear in retention.
 SELECT count(*) AS hits_kafka
   FROM `default_catalog`.`default_database`.kafka_order WHERE order_key = 424242;
-
--- Job 3 — Iceberg (the cold tier): Parquet scan with whatever pruning the layout allows,
--- over only the rows tiering has already flushed.
-SELECT count(*) AS hits_iceberg FROM bench_order$lake WHERE order_key = 424242;

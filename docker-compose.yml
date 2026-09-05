@@ -210,6 +210,10 @@ services:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
+        # Hadoop's static FileSystem cache keeps a reference to the user classloader, so Flink's
+        # leak check trips with "Trying to access closed classloader" on repeated SQL sessions.
+        # The leak is in a third-party lib we need (hadoop-client-* for Fluss's tiering writer).
+        classloader.check-leaked-classloader: false
     volumes: *flink-iceberg-vols
 
   taskmanager:
@@ -224,6 +228,7 @@ services:
         taskmanager.numberOfTaskSlots: 10
         taskmanager.memory.process.size: 2048m
         taskmanager.memory.framework.off-heap.size: 256m
+        classloader.check-leaked-classloader: false
     volumes: *flink-iceberg-vols
 
   sql-client:
@@ -236,6 +241,7 @@ services:
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
         rest.address: jobmanager
+        classloader.check-leaked-classloader: false
     volumes: *flink-iceberg-vols   # needed to read datalake `$lake` tables (union read)
 
 volumes:

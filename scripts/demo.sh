@@ -27,3 +27,5 @@ for ((i = 1; i <= ITERATIONS; i++)); do
 
   sleep 15
 done
+
+# Overall I want to run a system that send data to fluss and be able to query data live in a way easy for a user to do and also use an engine like starrocks to query the the iceberg tables at the data lake
