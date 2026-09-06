@@ -381,3 +381,5 @@ the map if you touch them.
   `/opt/flink/bin/sql-client.sh` directly.
 - **`sql-client` exits 0 even when a statement fails.** Both scripts grep the output for `[ERROR]`
   instead of trusting the exit code.
+
+<!-- dummy change -->
