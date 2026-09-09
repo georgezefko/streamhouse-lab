@@ -111,7 +111,7 @@ done
 
 # ── 4. StarRocks (only if the phase-3 overlay is running) ──────────────────────
 if docker ps --format '{{.Names}}' | grep -q starrocks; then
-  info "StarRocks (phase 3)"
+  info "StarRocks (Tutorial 3)"
   if retry 60 curl -sf http://localhost:8030/api/health; then
     pass "StarRocks FE  ${DIM}:8030${RESET}"
   else

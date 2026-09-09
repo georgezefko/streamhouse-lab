@@ -54,7 +54,7 @@ CREATE TABLE fluss_order (
 -- lake snapshot with the Fluss log; on a PK table that merge is a sort-merge, so it needs the
 -- lake reader to implement Fluss's SortedRecordReader. fluss-lake-iceberg 0.9.1 does not, and
 -- the read dies with "lake records must instance of sorted view". Log tables concatenate
--- instead of merging, so they union-read fine. See README, Scenario 2.
+-- instead of merging, so they union-read fine. See docs/EXPLANATION.md.
 CREATE TABLE datalake_enriched_orders (
   `order_key`        BIGINT,
   `cust_key`         INT NOT NULL,

@@ -1,22 +1,27 @@
 # Fluss Streamhouse (local)
 
-A local streamhouse: **Apache Fluss** as the sub-second hot tier, tiering continuously into
-**Apache Iceberg on MinIO**, cataloged by **Nessie** (Iceberg REST), with **StarRocks** as an
-optional OLAP engine over the cold tier. Compute is **Apache Flink 1.20**.
+A local **streamhouse**: [Apache Fluss](https://fluss.apache.org/) as the sub-second hot tier,
+tiering continuously into **Apache Iceberg on MinIO**, cataloged by **Nessie**, with
+**StarRocks** as an optional OLAP engine over the cold tier. Compute is **Apache Flink 1.20**.
 
 ```
- faker source ──▶ Fluss (hot: PK/log tables) ──tiering job──▶ Iceberg on MinIO ──▶ StarRocks
-                        │                                         ▲   (cold)
-                        └──────────── union read ─────────────────┘
+ faker sensors ──▶ Fluss (hot: PK + log tables) ──tiering job──▶ Iceberg on MinIO ──▶ StarRocks
+                        │                                             ▲   (cold)
+                        └──────────────── union read ─────────────────┘
                      (query the table = hot ∪ cold;  table$lake = cold only)
 ```
 
-The repo exists to make two claims reproducible on a laptop, rather than argued in prose:
+The tutorials below build a **real-time IoT analytics pipeline** on it — sensors, a device
+dimension, anomaly detection, a windowed fact table, a dashboard engine — and then show the two
+things that make it a streamhouse rather than a lakehouse or a queue:
 
 1. **vs a lakehouse** — the same table, same SQL, answers *now* from the hot tier while the
    Iceberg path is still waiting for the next flush.
 2. **vs Kafka** — a topic holds the same records but has no index, so answering "what is order
-   N?" means reading every offset. Kafka+Iceberg only becomes queryable by making a second copy.
+   N?" means reading every offset.
+
+**The reasoning lives in [`docs/EXPLANATION.md`](docs/EXPLANATION.md)** — the argument, the hard
+constraints, and the Fluss ⇄ Nessie ⇄ Iceberg seam. This file is just: run this, expect that.
 
 Companion to [*Query the Stream: An Introduction to the Streamhouse
 Pattern*](https://georgioszefkilis.substack.com/p/query-the-stream-an-introduction).
@@ -30,133 +35,174 @@ Pattern*](https://georgioszefkilis.substack.com/p/query-the-stream-an-introducti
 - **First `make up` pulls ~10 min of images** (MinIO, minio/mc, Nessie, ZooKeeper, Fluss, Flink,
   Kafka). `make jars` fetches 15 jars from Maven Central into `lib/` (gitignored, cached).
 - **Ports** that must be free: `8083` `9000` `9001` `19120` `9092`, plus `9030` `8030` `8040`
-  if you run Scenario 3.
+  if you run Tutorial 3.
+- `make sr-sql` needs a **`mysql` client on the host**. If you do not have one:
+  `docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root`.
 - Optional: open the repo in the **devcontainer** (`.devcontainer/`). It forwards every UI and
   installs `mc`, `duckdb`, `mysql`, `jq`, `pyiceberg`, `pynessie` for poking the stack from
   outside the containers.
 
 ## Quick start
 
-The happy path, in order. Only steps 1 and 5 block — everything else returns immediately and
+The happy path, in order. Only steps 1 and 4 block — everything else returns immediately and
 leaves Flink jobs running in the background.
 
 | # | Command | Blocks? | Result |
 |---|---|---|---|
 | 1 | `make up` | ~2 min (+pulls) | whole stack up; ends with the `verify.sh` gate |
-| 2 | `make sql`, paste `sql/01-tables.sql` | no | Fluss catalog + 4 tables |
-| 3 | same session, paste `sql/02` §1 then §2 | no | 2 detached Flink jobs, ~16 min of data |
-| 4 | `make tiering` | no | tiering job appears in the Flink UI |
-| 5 | `make demo` | ~90 s | the hot-vs-cold contrast |
+| 2 | `make sql`, paste `sql/07-iot-pipeline.sql` | no | 5 tables, 4 detached jobs, ~66 min of sensor data |
+| 3 | `make tiering` | no | tiering job appears in the Flink UI |
+| 4 | `make demo` | ~90 s | the hot-vs-cold contrast |
 
-Then optionally `make starrocks` (Scenario 3) and `make bench` (Scenario 4).
+Then `sql/09-iot-live.sql` for live queries (Tutorial 2), `make starrocks` (Tutorial 3), and
+`make bench` (Tutorial 4).
 
 UIs: Flink [`:8083`](http://localhost:8083) · MinIO console [`:9001`](http://localhost:9001)
 (admin/password) · Nessie [`:19120`](http://localhost:19120).
 
-> **`sql/02` is paste-in-parts, not `-f`.** Its first half submits streaming INSERTs that detach
-> as Flink jobs; its second half switches the session to `execution.runtime-mode = batch` to run
-> SELECTs. Paste the two halves separately.
-
 ---
 
-# Scenarios
+# Tutorials
 
-Each scenario states what it proves, how to run it, what a pass looks like, and what the common
-failures mean.
+Each one states what you run, what a pass looks like, and what the common failures mean.
+Tutorials 1 → 3 build on each other; Tutorial 4 is standalone.
 
-## Scenario 0 — the stack is wired
+## Tutorial 0 — bring the stack up
 
 ```bash
-make verify
+make up          # or `make verify` on its own, any time
 ```
 
 **Pass:** every line ✓, exit 0, ending in `All components up and wired. Safe to build.`
 
-Checks container states, MinIO/Nessie/Flink endpoints, that a TaskManager actually registered with
-the JobManager, and that both buckets exist. It is a **liveness gate only** — it does not assert
-the Fluss→Iceberg tiering seam, which does not exist until `make tiering`.
-
-`make up` runs this for you, so a green result is the last thing you see on bring-up.
-
-## Scenario 1 — the hot tier serves
-
-**Proves:** PK-table upserts, point lookups and lookup joins, all sub-second.
-
-`fluss_customer` and `fluss_nation` are PK tables — the lookup-join build sides, where the point
-lookups happen. `fluss_order` and `datalake_enriched_orders` are **log tables**: an append-only
-sink cannot consume the changelog a PK table emits in streaming mode, so making the tiered table
-append-only (for union read) forces its source to be append-only too.
-
-```bash
-make sql        # paste sql/01-tables.sql, then sql/02 §1 and §2
-```
-
-**Pass:** two RUNNING jobs in the Flink UI, and within seconds of the ingest starting, a batch
-`SELECT count(*) FROM datalake_enriched_orders` is non-zero and climbing. The rows are enriched —
-`cust_name` and `nation_name` are populated — which means the lookup joins against
-`fluss_customer` / `fluss_nation` are resolving per record.
+Checks container states, MinIO/Nessie/Flink endpoints, that a TaskManager actually registered
+with the JobManager, and that both buckets exist. It is a **liveness gate only** — it does not
+assert the Fluss→Iceberg tiering seam, which does not exist until `make tiering`.
 
 **When it fails:**
-- *0 rows, no jobs* — `sql/01` errored. Most likely the tables already exist; see
-  [Troubleshooting](#troubleshooting--reset).
-- *0 rows, jobs present* — the `EXECUTE STATEMENT SET` job died. Flink UI → the job →
-  *Exceptions*.
-- *`Table sink ... doesn't support consuming update and delete changes`* — a PK table is feeding
-  an append-only sink. Both ends of the enrichment INSERT must be log tables.
+- *Fluss containers restarting* — expected on first bring-up. They use `restart: on-failure` to
+  survive the Nessie boot race; `depends_on` waits for container start, not for Quarkus to be
+  serving `:19120`. Give it a minute.
 
-## Scenario 2 — streamhouse vs lakehouse
+---
 
-**Proves:** the freshness claim. Same table, same SQL, two read paths — the bare table unions
-hot+cold, the `$lake` suffix reads cold only.
+## Tutorial 1 — a real-time IoT pipeline on the streamhouse
+
+**Builds:** sensors → Fluss → two tiered tables → Iceberg. This is the pipeline everything else
+queries.
 
 ```bash
-make tiering    # once, after the tables exist
-make demo       # `make demo N=12` for more iterations
+make sql                          # paste sql/07-iot-pipeline.sql, all of it
+make tiering                      # then start moving hot -> cold
 ```
 
-`make demo` runs `sql/03-contrast.sql` on a loop and prints:
+What the file creates:
+
+| Table | Kind | Tiered | Role |
+|---|---|---|---|
+| `dim_device` | **PK** on `device_id` | no | 11 devices with per-device temperature thresholds; the lookup-join build side |
+| `iot_telemetry` | log | no | raw readings, 50/s |
+| `iot_events` | log | **yes** | failure / maintenance / inspection, with severity |
+| `datalake_device_telemetry` | log | **yes** | every reading, enriched with its device's threshold + `anomaly_flag` |
+| `datalake_device_health_1min` | log | **yes** | the fact table: 1-minute windows per device — reading count, anomaly count, avg/min/max temp |
+
+The pipeline is four detached Flink jobs: two ingest, two derive. The derive side does a
+**lookup join** — one point lookup against `dim_device` per incoming reading — and then fans the
+result into a per-reading table and a windowed aggregate.
+
+**Pass:**
+- the `dim_device` seed job shows **FINISHED** in the Flink UI ([`:8083`](http://localhost:8083))
+- 4 jobs **RUNNING** alongside it, plus the tiering job after `make tiering`
+- within seconds:
+  ```sql
+  SET 'execution.runtime-mode' = 'batch';
+  SELECT count(*) FROM datalake_device_telemetry;         -- non-zero and climbing
+  SELECT count(*) FROM datalake_device_telemetry WHERE anomaly_flag;   -- also non-zero
+  ```
+- `temp_threshold`, `location_id` and `model` are populated — the lookup join is resolving
+- after ~1 minute, `SELECT count(*) FROM datalake_device_health_1min` becomes non-zero
+
+**When it fails:**
+- *`Table fluss.<name> already exists` right after a `DROP TABLE`* — dropping a tiered table
+  leaves an orphan in Nessie. See [Troubleshooting](#troubleshooting--reset).
+- *`Table sink ... doesn't support consuming update and delete changes`* — a PK table is feeding
+  an append-only sink, or the window emitted a changelog. Everything downstream of
+  `iot_telemetry` must be append-only.
+  [Why](docs/EXPLANATION.md#a-log-table-sink-cannot-consume-a-pk-tables-changelog).
+- *`temp_threshold` all NULL* — the `dim_device` seed did not finish before the derive jobs
+  started. `sql/07` uses `SET 'table.dml-sync' = 'true'` around the seed to prevent exactly
+  this; if you pasted statements out of order, re-run the seed.
+- *`datalake_device_health_1min` stays empty past 2 minutes* — check the second derive job's
+  *Exceptions* tab in the Flink UI.
+
+---
+
+## Tutorial 2 — query hot and cold on the go
+
+**Proves:** the freshness claim. Same table, same SQL, two read paths — the bare table unions
+hot + cold, the `$lake` suffix reads cold only.
+
+### Live, in an interactive session
+
+```bash
+make sql                          # paste sql/09-iot-live.sql
+```
+
+Section A runs in **streaming** mode with `result-mode = table`: an anomaly feed and a rolling
+per-device rollup that update in place, read straight off the tiered table. Section B flips to
+batch and puts the three read paths side by side — `t`, `t$lake`, `t$lake$snapshots`.
+
+`sql-client.sh -f` cannot render an updating view, so these only work interactively. Concurrent
+sessions are fine — `make sql` runs a throwaway container each time.
+
+### The contrast, on a loop
+
+```bash
+make demo                         # `make demo N=12` for more iterations
+```
+
+`make demo` loops `sql/08-iot-contrast.sql` and prints:
 
 ```
 +---------------+-----------+------------------+
 | hot_plus_cold | cold_only | rows_only_in_hot |
 +---------------+-----------+------------------+
-|          4920 |      4550 |              370 |
+|          6600 |      5100 |             1500 |
 +---------------+-----------+------------------+
 
-+-------------------+-------------+---------------+
-| order_only_in_hot | total_price |     cust_name |
-+-------------------+-------------+---------------+
-|          63106392 |      289.44 |  Penny Profit |
-|          71016798 |      895.50 | Sam Dayoulpay |
-|          71469616 |      845.82 |    Moe Skeeto |
-+-------------------+-------------+---------------+
++-----------------------+-------------------+
+| windows_hot_plus_cold | windows_cold_only |
++-----------------------+-------------------+
+|                    22 |                11 |
++-----------------------+-------------------+
+
++---------------------+-----------+-------------+--------------+
+| reading_only_in_hot | device_id | temperature | anomaly_flag |
++---------------------+-----------+-------------+--------------+
+|            49615937 | device_5  |        23.5 |        FALSE |
+|            78509075 | device_7  |        26.1 |        FALSE |
+|            68761453 | device_2  |        35.0 |         TRUE |
++---------------------+-----------+-------------+--------------+
+
++-----------+-----------+------------+
+| device_id | anomalies | worst_temp |
++-----------+-----------+------------+
+| device_7  |       275 |       44.9 |
+| device_4  |       259 |       45.0 |
+| device_2  |       242 |       45.0 |
++-----------+-----------+------------+
 ```
 
-**Pass:** `rows_only_in_hot` > 0 on every iteration, `cold_only` advancing in visible ~30 s steps
-(`table.datalake.freshness`), and the second query naming actual orders — those are rows you can
-query in the streamhouse right now that are *not on the Iceberg path yet*.
+`device_7` leading is not luck: its threshold is 32.0 °C, the lowest of the eleven. The last
+query is proof the lookup join resolved a per-device threshold for every reading.
 
-The second query is an **anti-join against `$lake`**, not `max(order_key)`. The faker generates
-`order_key` at random, so the largest key is not the newest row — it is usually one tiered long
-ago, and a `max()`-based test reports a false negative.
+**Pass:** `rows_only_in_hot` > 0 on every iteration, `cold_only` advancing in visible ~30 s
+steps (`table.datalake.freshness`), and the anti-join naming actual readings — rows you can
+query in the streamhouse right now that are *not on the Iceberg path yet*. The same gap shows on
+`datalake_device_health_1min`, which is the one that matters: that is the table a dashboard reads.
 
-**When it fails:**
-- *`cold_only` stuck at 0* — the tiering job is not running or crashed. Check the Flink UI and
-  `make logs`.
-- *`lake records must instance of sorted view`* — the tiered table has a PRIMARY KEY. See
-  [the union-read constraint](#union-read-needs-a-log-table) below.
-- *`Batch mode can only be supported if one lake snapshot exists`* — nothing has been tiered yet.
-  The bare table is not readable in batch at all until the first flush; wait ~30 s after
-  `make tiering`, or check `<table>$lake` first.
-- *`Trying to access closed classloader`* — Hadoop's static `FileSystem` cache pins the user
-  classloader and Flink's leak check trips, intermittently, on repeated SQL sessions. Disabled via
-  `classloader.check-leaked-classloader: false` in `docker-compose.yml`; if you see it again, that
-  setting did not reach the service that threw.
-- *numbers identical between iterations* — the faker source drained; nothing new is arriving.
-- *`rows_only_in_hot` = 0* — the faker source drained. It is finite: `source_order` is 10,000 rows
-  at 10/s, so ~16 minutes. Once it drains, tiering catches up completely and the gap closes —
-  correct behaviour, but no longer a contrast. Run `make demo` **while `sql/02` is still
-  ingesting**, or reset and start over.
+The second query is an **anti-join against `$lake`**, not `max(reading_id)` —
+[why](docs/EXPLANATION.md#why-the-anti-join-not-max).
 
 ### The sharper version: kill the tiering job
 
@@ -164,57 +210,98 @@ Cancel the tiering job in the Flink UI, then re-run `make demo`. `cold_only` **f
 `hot_plus_cold` keeps climbing — the lake tier is now visibly a stale copy while the hot tier
 serves. `make tiering` restarts it and the cold number catches up in one jump.
 
-### Union read needs a log table
+**When it fails:**
+- *`cold_only` stuck at 0* — the tiering job is not running or crashed. Check the Flink UI and
+  `make logs`.
+- *`Batch mode can only be supported if one lake snapshot exists`* — nothing has been tiered
+  yet. The bare table is not readable in batch at all until the first flush; wait ~30 s after
+  `make tiering`, or check `<table>$lake` first.
+- *`lake records must instance of sorted view`* — a tiered table has a PRIMARY KEY.
+  [Why that is fatal](docs/EXPLANATION.md#union-read-requires-log-tables).
+- *`Trying to access closed classloader`* — Hadoop's static `FileSystem` cache pins the user
+  classloader and Flink's leak check trips intermittently on repeated SQL sessions. Disabled via
+  `classloader.check-leaked-classloader: false` in `docker-compose.yml`; if you see it again,
+  that setting did not reach the service that threw.
+- *numbers identical between iterations, or `rows_only_in_hot` = 0* — the faker source drained.
+  It is finite (200,000 readings at 50/s ≈ 66 min). Once it drains, tiering catches up
+  completely and the gap closes — correct behaviour, but no longer a contrast. Run `make demo`
+  **while `sql/07` is still ingesting**, or reset and start over.
 
-`datalake_enriched_orders` has **no primary key**, deliberately.
+---
 
-Union read merges the lake snapshot with the Fluss log. On a PK table that merge is a
-*sort-merge*, so Fluss's `LakeSnapshotAndLogSplitScanner` requires the lake reader to implement
-`org.apache.fluss.lake.source.SortedRecordReader`. `fluss-lake-iceberg-0.9.1-incubating` does not
-implement it anywhere — reading the bare table throws:
+## Tutorial 3 — StarRocks reads the cold tier only
 
-```
-java.lang.UnsupportedOperationException: lake records must instance of sorted view.
-```
-
-Log tables concatenate rather than merge, so they union-read fine. This is why the tiered table
-is a log table and the PK tables (`fluss_order`, `fluss_customer`, `fluss_nation`) are not
-tiered. Paimon's reader does implement the interface; Iceberg union read on PK tables is a
-post-0.9 roadmap item.
-
-## Scenario 3 — an external engine reads the cold tier
-
-**Proves:** the cold tier is just Iceberg. An OLAP engine reads it with Fluss nowhere in the path.
+**Proves:** the cold tier is just Iceberg. An OLAP engine reads it with Fluss nowhere in the
+path — no connector, no coordination, no awareness that Fluss exists.
 
 ```bash
-make starrocks           # wait for the healthcheck to go healthy (~1-2 min)
-make sr-sql              # paste sql/04-starrocks.sql
+make starrocks                    # wait for the healthcheck (~1-2 min)
+make sr-sql                       # paste sql/04-starrocks.sql
 ```
 
-**Pass:** `SHOW DATABASES FROM iceberg_nessie` lists the Fluss database, and
-`SELECT sum(total_price) FROM datalake_enriched_orders` returns a value **below** the hot-tier
-number from Scenario 2. That gap is the point: StarRocks sees only what tiering has flushed.
+`sql/04` registers an external Iceberg catalog over Nessie, then runs the dashboard queries:
+temperature vs each device's threshold, events by type and severity, and devices ranked by
+anomalous windows.
+
+**Pass:** `SHOW DATABASES FROM iceberg_nessie` lists the `fluss` database, and the third panel
+ranks devices by how much time they spend over their own threshold — which comes out **ordered
+by threshold**, because that is the only thing that differs between them:
+
+```
+device_id  threshold  windows  anomalous_readings  pct_over_threshold
+device_7        32.0        3                 311                41.6
+device_4        33.0        3                 287                40.1
+device_10       34.5        3                 307                39.4
+...
+device_6        37.0        3                 182                23.7
+device_8        38.0        3                 149                20.6
+```
+
+That monotonic fall from 41.6% to 20.6% is the end-to-end proof: StarRocks is reading a fact
+table whose per-device thresholds were resolved by a lookup join in Flink, tiered to Iceberg,
+and never touched Fluss on the way out.
+
+Then the freshness half:
+
+```sql
+SELECT count(*) FROM datalake_device_telemetry;
+```
+
+returns a value **below** the `hot_plus_cold` number from Tutorial 2 — 14,100 against 23,750 on
+the run these numbers came from. That gap is the whole point: StarRocks sees only what tiering
+has flushed. It is reading Parquet out of MinIO through a Nessie catalog — exactly what any
+Iceberg-aware engine would do.
 
 **When it fails:**
-- *Catalog registers but no databases* — nothing has been tiered yet. Run Scenario 2 first.
+- *Catalog registers but no databases* — nothing has been tiered yet. Run Tutorial 1 and
+  `make tiering` first.
 - *FE not healthy* — StarRocks `allin1` is memory-hungry; check Docker's allocation.
+- *`mysql: command not found`* — see [Prerequisites](#prerequisites).
+- *`Catalog 'iceberg_nessie' already exists`* — you should not see this; `sql/04` uses
+  `IF NOT EXISTS` so it is safe to re-run. If you edited it out, `DROP CATALOG iceberg_nessie`.
+- *every device shows the same anomaly rate* — the panel is reading `anomaly_flag` rather than
+  `cnt_anomalies`. Over a full minute the max reading almost always clears the threshold, so the
+  flag saturates; rank on the rate.
 
-## Scenario 4 — Fluss vs Kafka
+---
 
-**Proves:** the queryability claim. A Kafka topic and a Fluss table hold the same volume of orders
-over the same key space. Asking one question of each costs wildly different amounts.
+## Tutorial 4 — why not just Kafka?
 
-Needs a **second SQL client session** alongside the one from Scenario 1 — `make sql` opens a
-throwaway container per invocation, so concurrent sessions are fine.
+**Proves:** the queryability claim. A Kafka topic and a Fluss table hold the same volume of
+records over the same key space. Asking one question of each costs wildly different amounts.
+
+This one is standalone — it uses its own orders dataset and does not touch the IoT pipeline.
+It needs a **second SQL client session** alongside anything from Tutorial 1.
 
 ```bash
 make sql        # second session: paste sql/05-bench-load.sql, leave it running
-                # wait ~100 s (2M rows at 20k/s)
+                # wait ~100 s
 make bench      # third shell
 ```
 
-`sql/05` fans one bulk faker stream into both a Fluss PK table and a Kafka topic. `make bench`
-then runs `sql/06-bench-query.sql` — *"what is order 424242?"* — three times:
+`sql/05` fans one bulk faker stream into both a Fluss PK table and a Kafka topic (20M rows at
+20k/s ≈ 17 min). `make bench` then runs `sql/06-bench-query.sql` — *"what is order 424242?"* —
+against each:
 
 ```
 engine                           state        duration
@@ -222,165 +309,106 @@ Fluss (PK point lookup)          FINISHED        335 ms
 Kafka (scan to latest offset)    FINISHED       2312 ms
 ```
 
-Measured on a 2M-row table/topic on a laptop. The Fluss leg is flat across repeated runs
-(335 / 336 / 313 ms) and is close to Flink's bare job-startup cost — while Kafka spends ~1.7-2.3 s
-deserializing the same 2M records to find one. If Fluss were scanning rather than looking up, the
-two would be in the same ballpark; they are not.
+Measured on a 2M-row table/topic on a laptop, part-way through the load. The Fluss leg is flat
+across repeated runs (335 / 336 / 313 ms) and is close to Flink's bare job-startup cost — while
+Kafka spends ~1.7-2.3 s deserializing every record to find one.
 
-**Pass:** run `make bench` two or three times, a minute apart, **while `sql/05` is still loading**.
-The Fluss row stays flat while the Kafka row grows with the topic. That divergence is the whole
-argument — absolute numbers are laptop-bound and not interesting.
+**Pass:** run `make bench` two or three times, a minute apart, **while `sql/05` is still
+loading**. The Fluss row stays flat while the Kafka row grows with the topic. That divergence is
+the whole argument — absolute numbers are laptop-bound and not interesting.
 
-Bench a *drained* topic and both numbers just sit still: there is nothing left to grow. `sql/05`
-loads 20M rows at 20k/s (~17 min) to give you a window wide enough to see it.
+Bench a *drained* topic and both numbers just sit still: there is nothing left to grow. The 20M
+row count exists to give you a window wide enough to see it.
 
-- **Fluss** has a primary-key index. A full-PK predicate is a point lookup, and its cost does not
-  move as the table grows.
+- **Fluss** has a primary-key index. A full-PK predicate is a point lookup, and its cost does
+  not move as the table grows.
 - **Kafka** has offsets, not indexes. Flink deserializes every record from earliest to latest
-  offset (`scan.bounded.mode`), so cost is linear in retention. Kafka+Iceberg gets you a queryable
-  copy only by *making a second copy*.
+  offset (`scan.bounded.mode`), so cost is linear in retention. Kafka + Iceberg gets you a
+  queryable copy only by *making a second copy*.
 
-`bench_order` is a PK table but is **not** tiered — the point is to price a pure hot-tier lookup,
-and a tiered PK table cannot be union-read at all (see above). Scenario 2 already prices the cold
-tier.
+`bench_order` is a PK table but is **not** tiered —
+[why](docs/EXPLANATION.md#why-bench_order-is-not-tiered).
 
 Timings are Flink job durations pulled from the REST API, not wall clock: `docker compose run`
 costs several seconds of container startup that would swamp everything being measured.
 
-**Note on `sql/05`:** every `CREATE TEMPORARY TABLE` in it is catalog-qualified on purpose. An
-unqualified `CREATE` lands in whatever catalog is current, so pasting it after `sql/01` (which ends
-in `USE CATALOG fluss_catalog`) would put the faker source in the wrong place and the statement set
-would not find it.
+Kafka is a Tutorial-4-only dependency. Nothing else in the stack talks to it, and `verify.sh`
+does not gate on it.
 
-Kafka is a Scenario-4-only dependency. Nothing else in the stack talks to it, and `verify.sh` does
-not gate on it.
+---
+
+## Appendix — the original orders walkthrough
+
+The first version of this lab used TPC-H-shaped orders instead of sensors. It still works and
+the published blog post refers to it:
+
+```bash
+make sql          # paste sql/01-tables.sql, then sql/02 §1 and §2 separately
+make tiering
+make demo-orders
+```
+
+`fluss_customer` and `fluss_nation` are PK tables (the lookup-join build sides);
+`fluss_order` and `datalake_enriched_orders` are log tables. `sql/02` is **paste-in-parts, not
+`-f`**: its first half submits streaming INSERTs that detach as Flink jobs, its second half
+switches the session to batch to run SELECTs. `source_order` is 10,000 rows at 10/s (~16 min),
+so the contrast window is much narrower than the IoT one.
 
 ---
 
 ## Troubleshooting & reset
 
-**`sql/01` errors on a re-run.** The Fluss catalog ignores `CREATE TABLE IF NOT EXISTS` — it still
-errors if the table exists. `DROP TABLE` the ones you need, or do a full reset.
+**`sql/07` or `sql/01` errors on a re-run.** The Fluss catalog ignores
+`CREATE TABLE IF NOT EXISTS` — it still errors if the table exists. `DROP TABLE` the ones you
+need, or do a full reset.
 
 **`Table fluss.<name> already exists` right after a successful `DROP TABLE`.** Dropping a
 datalake-enabled Fluss table removes it from Fluss but **leaves the Iceberg table registered in
 Nessie**, and the recreate fails on that orphan. `SHOW TABLES` in `fluss_catalog` will not list
-it; the Iceberg catalog will. Drop it there — the Iceberg jars are already on the Flink classpath:
+it; the Iceberg catalog will. The recipe for dropping it there is in
+[`docs/EXPLANATION.md`](docs/EXPLANATION.md#dropping-a-tiered-table-leaves-an-orphan-in-nessie).
 
-```sql
-CREATE CATALOG ice WITH (
-  'type'='iceberg',
-  'catalog-impl'='org.apache.iceberg.nessie.NessieCatalog',
-  'uri'='http://nessie:19120/api/v2',
-  'ref'='main',
-  'warehouse'='s3://warehouse/',
-  'io-impl'='org.apache.iceberg.aws.s3.S3FileIO',
-  's3.endpoint'='http://minio:9000',
-  's3.access-key-id'='admin',
-  's3.secret-access-key'='password',
-  's3.path-style-access'='true',
-  'client.region'='us-east-1'
-);
-USE CATALOG ice;
-SHOW TABLES IN fluss;
-DROP TABLE fluss.<name>;
-```
+**Full reset is `make down`** (`docker compose down -v`). This is the *correct* reset, not a
+heavy one: Nessie is `IN_MEMORY`, so its catalog dies with the container regardless, and
+dropping the MinIO volume is what stops orphaned Iceberg data files from outliving their catalog
+entries. Then start again from `sql/07`. `make clean` additionally deletes `lib/*.jar`, which
+`make up` re-fetches.
 
-**Full reset is `make down`** (`docker compose down -v`). This is the *correct* reset, not a heavy
-one: Nessie is `IN_MEMORY`, so its catalog dies with the container regardless, and dropping the
-MinIO volume is what stops orphaned Iceberg data files from outliving their catalog entries. Then
-start again from `sql/01`. `make clean` additionally deletes `lib/*.jar`, which `make up`
-re-fetches.
+**Fluss containers restart a couple of times on first bring-up.** Expected — the Nessie boot
+race. See Tutorial 0.
 
-**Fluss containers restart a couple of times on first bring-up.** Expected. They use
-`restart: on-failure` to survive the Nessie boot race — `depends_on` waits for container start,
-not for Quarkus to be serving `:19120`.
+**Concurrent SQL sessions are fine.** `make sql` runs a throwaway container each time;
+Tutorials 2 and 4 both want two at once.
 
-**Concurrent SQL sessions are fine.** `make sql` runs a throwaway container each time; Scenario 4
-requires two at once.
+**Numbers frozen, no errors.** A faker source drained. Check the
+[table of source lifetimes](docs/EXPLANATION.md#why-the-sources-are-bounded-and-what-drains).
 
 **Where to look when a job misbehaves:** Flink UI [`:8083`](http://localhost:8083) for job state
-and exceptions, `make logs` for the Fluss servers, `docker compose logs <svc>` for everything else.
+and exceptions, `make logs` for the Fluss servers, `docker compose logs <svc>` for everything
+else.
 
 ---
-
-# Reference
-
-## Stack / versions
-
-| Component | Pin | Notes |
-|---|---|---|
-| Fluss | `0.9.1-incubating` | CoordinatorServer + TabletServer + ZooKeeper 3.9.2 |
-| Flink | `1.20` (`fluss-quickstart-flink:1.20-0.9.1-incubating`) | **Do not use 2.x** — connector is 1.20 |
-| Object store | MinIO | buckets: `fluss` (hot remote), `warehouse` (cold Iceberg) |
-| Table format | Iceberg `1.10.1` | server-side jars mounted into Fluss |
-| Catalog | Nessie `0.108.2` | native Nessie API @ `:19120/api/v2` (see below) — `0.99.0` NPEs on Fluss's Iceberg 1.10 client (optional `lastColumnId`); needs ≥0.108 |
-| Kafka | `apache/kafka:3.9.1` | Scenario 4 only; single-node KRaft, no ZooKeeper |
-| OLAP (opt) | StarRocks allin1 | external Iceberg catalog over Nessie |
-
-Ports: Flink `8083` · MinIO API `9000` / console `9001` (admin/password) · Nessie `19120` ·
-Kafka `9092` · StarRocks `9030` (+ `8030`, `8040`).
 
 ## Repo layout
 
 | Path | What |
 |---|---|
+| `docs/EXPLANATION.md` | the argument, the constraints, the seam — **read this to change things** |
 | `docker-compose.yml` | ZK, MinIO(+init), Nessie, Fluss (coordinator+tablet), Flink (JM/TM/sql-client), Kafka |
-| `docker-compose.starrocks.yml` | Scenario 3 overlay |
+| `docker-compose.starrocks.yml` | Tutorial 3 overlay |
 | `scripts/download-jars.sh` | fetches `lib/*.jar` (mounted into Flink + Fluss) |
 | `scripts/verify.sh` | the liveness gate |
 | `scripts/start-tiering.sh` | submits the Fluss→Iceberg tiering job |
-| `scripts/demo.sh` | loops `sql/03-contrast.sql` |
+| `scripts/demo.sh` | loops a contrast query; `SQL_FILE=` picks which |
 | `scripts/bench.sh` | runs `sql/06`, reads job durations from the Flink REST API |
-| `sql/01-tables.sql` | catalog, PK tables, the tiered table |
-| `sql/02-ingest-and-query.sql` | faker → Fluss, lookup-join enrichment, union read |
-| `sql/03-contrast.sql` | the hot-vs-cold contrast query |
-| `sql/04-starrocks.sql` | external Iceberg catalog over Nessie |
-| `sql/05-bench-load.sql` | bulk load into both Fluss and Kafka |
-| `sql/06-bench-query.sql` | the same point query, three engines |
+| `sql/07-iot-pipeline.sql` | **Tutorial 1** — the IoT pipeline, end to end |
+| `sql/08-iot-contrast.sql` | **Tutorial 2** — hot vs cold, `-f`-safe (what `make demo` loops) |
+| `sql/09-iot-live.sql` | **Tutorial 2** — live queries, interactive only |
+| `sql/04-starrocks.sql` | **Tutorial 3** — external Iceberg catalog + the dashboard panels |
+| `sql/05-bench-load.sql` | **Tutorial 4** — bulk load into both Fluss and Kafka |
+| `sql/06-bench-query.sql` | **Tutorial 4** — the same point query, two engines |
+| `sql/01-tables.sql` | appendix — orders catalog, PK tables, the tiered table |
+| `sql/02-ingest-and-query.sql` | appendix — faker → Fluss, lookup-join enrichment, union read |
+| `sql/03-contrast.sql` | appendix — the orders hot-vs-cold query |
 
-## How the Fluss ⇄ Nessie ⇄ Iceberg seam actually works (validated)
-
-Getting tiering working end-to-end took four non-obvious fixes. All are in the code now; this is
-the map if you touch them.
-
-1. **Use the NATIVE Nessie catalog, not Iceberg-REST.** We use
-   `datalake.iceberg.catalog-impl: org.apache.iceberg.nessie.NessieCatalog` against Nessie's own API
-   (`http://nessie:19120/api/v2`, `ref: main`), **not** `RESTCatalog` against `/iceberg/main`.
-   Nessie's Iceberg-REST `createTable` NPEs with Fluss 0.9.1's Iceberg 1.10 client (it drops the
-   deprecated `lastColumnId`); the native catalog commits via Nessie's git-like API and works.
-2. **The Flink tiering job needs the whole iceberg plugin set on `/opt/flink/lib`.** The Flink image
-   ships **no** iceberg at all. `scripts/download-jars.sh` fetches `fluss-lake-iceberg` (the
-   `LakeStoragePlugin`), `iceberg-nessie` + `nessie-client`/`nessie-model`/jackson/microprofile,
-   `hadoop-client-*` (Fluss's tiering writer requires Hadoop), `failsafe` (iceberg-aws S3 retries),
-   and `iceberg-flink-runtime` (to *read* `$lake`). `docker-compose.yml` mounts them via the
-   `x-flink-iceberg-vols` anchor.
-3. **S3 for local MinIO needs the STS assume-role endpoint set.** Fluss vends S3 delegation tokens
-   to clients via STS; without pointing STS at MinIO it calls real AWS → `403 InvalidClientTokenId`.
-   The Fluss servers set `s3.assumed.role.arn` + `s3.assumed.role.sts.endpoint: http://minio:9000`
-   (matching the official quickstart's RustFS wiring).
-4. **`failsafe` also belongs in the Fluss server plugin dir** — reading an existing Iceberg table's
-   metadata (e.g. `CREATE TABLE IF NOT EXISTS`) needs it server-side, not just on Flink.
-
-### Smaller notes
-- **Iceberg union read is log-tables-only in 0.9.1.** `fluss-lake-iceberg` ships no
-  `SortedRecordReader`, so a tiered PK table cannot be read as hot ∪ cold. See
-  [Union read needs a log table](#union-read-needs-a-log-table).
-- **The bare table is unreadable in batch until the first lake snapshot exists** —
-  `Batch mode can only be supported if one lake snapshot exists for the table`. `$lake` reads
-  return 0 rows in that window; the union read errors.
-- **`sql-client.sh -f` skips the image's init script**, so the pre-baked faker sources
-  (`source_order`, `source_customer`, `source_nation`) do not exist in a `-f` session. Scripted
-  SQL must define its own sources, as `sql/05-bench-load.sql` does.
-- **Tiering jar filename is version-specific.** `start-tiering.sh` assumes
-  `fluss-flink-tiering-0.9.1-incubating.jar`. If missing: `docker compose exec jobmanager ls /opt/flink/opt | grep tiering`.
-- **Nessie is `IN_MEMORY`** — catalog state dies on `docker compose down`. For branch-lifecycle demos
-  that survive restarts, switch to `nessie.version.store.type=ROCKSDB` with a mounted volume.
-- **`sql-client` drops `-f`.** `/opt/sql-client/sql-client` (the image default command) hardcodes
-  its args, so `-f` is silently ignored. `demo.sh` and `bench.sh` call
-  `/opt/flink/bin/sql-client.sh` directly.
-- **`sql-client` exits 0 even when a statement fails.** Both scripts grep the output for `[ERROR]`
-  instead of trusting the exit code.
-
-<!-- dummy change -->
-<!-- dummy change: worktree branch naming -->
+Stack versions are in [`docs/EXPLANATION.md`](docs/EXPLANATION.md#stack--versions).
