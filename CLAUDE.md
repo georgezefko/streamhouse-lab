@@ -9,10 +9,14 @@ A Docker Compose lab, not an application: no build, no test suite, no linter. It
 (cataloged by Nessie), with Flink 1.20 as compute. It backs a blog series, so the deliverable is a
 *reproducible tutorial*, not a feature.
 
-The main narrative is a **real-time IoT pipeline** (`sql/07`-`sql/09`): faker sensors → Fluss →
-a per-reading enriched table + a 1-minute windowed fact table, both tiered to Iceberg, read by
-StarRocks. It is a streamhouse rebuild of the author's kappa-architecture post
-(Kafka → Spark Structured Streaming → StarRocks, no lake).
+The main narrative is a **real-time IoT pipeline** (`sql/07`-`sql/10`): a producer publishes JSON
+to the Kafka topics `iot-telemetry` / `iot-events` → Flink lands them in Fluss → a per-reading
+enriched table + a 1-minute windowed fact table, both tiered to Iceberg, read by StarRocks.
+
+Kafka is the **ingress for the main tutorial**, not a Tutorial-4-only dependency any more.
+`sql/07` is only a stand-in producer: swap in any producer on the same topics with the same
+field names and `sql/08` onward is unchanged. It mirrors the author's Mage/lambda pipeline
+(Kafka → Mage → a second Kafka topic → StarRocks Routine Load), with the second copy removed.
 
 Two claims the repo exists to demonstrate:
 1. **vs a lakehouse** — the bare table answers now; the `$lake` path waits for the next flush.
@@ -32,7 +36,7 @@ make up          # jars + whole stack + verify gate
 make verify      # liveness gate (containers, endpoints, TM registration, buckets)
 make sql         # interactive Flink SQL client; paste sql/*.sql by hand
 make tiering     # submit the Fluss→Iceberg tiering job
-make demo        # Tutorial 2: loops sql/08-iot-contrast.sql
+make demo        # Tutorial 2: loops sql/09-iot-contrast.sql
 make demo-orders # same, on the orders appendix (SQL_FILE=/sql/03-contrast.sql)
 make starrocks   # Tutorial 3 overlay
 make bench       # Tutorial 4: Fluss vs Kafka point-lookup cost
@@ -80,6 +84,11 @@ Flink classpath — recipe is in `docs/EXPLANATION.md`), or `make down`.
 
 **The Fluss catalog ignores `CREATE TABLE IF NOT EXISTS`** — it still errors if the table exists.
 
+**JSON timestamps on Kafka need `'json.timestamp-format.standard' = 'ISO-8601'`.** Python's
+`datetime.isoformat()` emits `2025-09-09T20:15:30.123` with a `T`; Flink's JSON format defaults
+to `SQL`, which expects a space, and silently yields NULL. Set it on both producer and consumer
+(`sql/07` and `sql/08` both do).
+
 **Use the native Nessie catalog, not Iceberg-REST.** `NessieCatalog` against `/api/v2`. Nessie's
 Iceberg-REST `createTable` NPEs with Fluss 0.9.1's Iceberg 1.10 client. StarRocks still reads via
 the REST endpoint — reads are fine, only REST writes NPE.
@@ -93,7 +102,7 @@ the REST endpoint — reads are fine, only REST writes NPE.
 - It **exits 0 even when a statement fails**. Both scripts grep output for `[ERROR]` instead.
 - `-f` skips the image's init script, so the pre-baked faker sources (`source_order`,
   `source_customer`, `source_nation`) do not exist in a scripted session. Scripted SQL must define
-  its own sources — see `sql/07-iot-pipeline.sql` and `sql/05-bench-load.sql`.
+  its own sources — see `sql/07-iot-produce.sql` and `sql/05-bench-load.sql`.
 - **Qualify every `CREATE TEMPORARY TABLE` / `CREATE TEMPORARY VIEW`.** An unqualified `CREATE`
   lands in whatever catalog is current, which breaks when a file is pasted after one ending in
   `USE CATALOG fluss_catalog`.
@@ -107,7 +116,7 @@ the REST endpoint — reads are fine, only REST writes NPE.
 The faker generates `reading_id` / `order_key` **at random**, not monotonically. `max(id)` is not
 the newest row — it is usually one tiered long ago, so a `max()`-based freshness test reports a
 false negative. Use an anti-join against `$lake` to find rows that genuinely are not in the lake
-(`sql/08-iot-contrast.sql` and `sql/03-contrast.sql` both do this).
+(`sql/09-iot-contrast.sql` and `sql/03-contrast.sql` both do this).
 
 Every faker source is **bounded**: `sql/07`'s telemetry is 200k rows at 50/s (~66 min), events
 20k at 5/s; `source_order` is 10k at 10/s (~16 min); `sql/05`'s is 20M at 20k/s (~17 min). Every

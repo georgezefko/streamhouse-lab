@@ -22,14 +22,15 @@ SET 'sql-client.execution.result-mode' = 'table';
 -- A1) Anomaly feed. Every reading above its own device's threshold, as it lands.
 --     This is a streaming read of the TIERED table — it starts from the lake snapshot
 --     and switches to the Fluss log, so you are watching hot ∪ cold advance.
-SELECT device_id, location_id, temperature, temp_threshold, ingest_time
+SELECT device_id, location_id, temperature, temp_threshold, vibration, event_time
 FROM datalake_device_telemetry
-WHERE anomaly_flag;
+WHERE anomaly_flag OR vibration_spike;
 
 -- A2) Rolling health per device. Numbers move continuously; no batch, no refresh.
 SELECT device_id,
        count(*) AS readings,
        sum(CASE WHEN anomaly_flag THEN 1 ELSE 0 END) AS anomalies,
+       sum(CASE WHEN vibration_spike THEN 1 ELSE 0 END) AS vib_spikes,
        round(max(temperature), 1) AS worst_temp
 FROM datalake_device_telemetry
 GROUP BY device_id;

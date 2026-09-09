@@ -1,16 +1,15 @@
--- Tutorial 1: a real-time IoT analytics pipeline on the streamhouse.
+-- Tutorial 1, step 2: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
 --
--- Sensors -> Fluss (hot) -> two tiered tables -> Iceberg on MinIO (cold).
+--   kafka: iot-telemetry ─┐
+--                         ├─▶ iot_telemetry (log) ──lookup join dim_device──▶ enriched
+--   kafka: iot-events   ──┴─▶ iot_events (log, tiered)                          │
+--                                                                               ├─▶ datalake_device_telemetry   (per reading)
+--                                                                               └─▶ datalake_device_health_1min (1-min window)
+--
+-- Requires the topics to exist — run sql/07-iot-produce.sql first, or point your own
+-- producer at iot-telemetry / iot-events.
+--
 -- Paste this whole file into an interactive session:  make sql
---
--- Shape of the pipeline:
---   source_telemetry (faker) ─┐
---                             ├─▶ iot_telemetry (log) ──lookup join dim_device──▶ enriched
---   source_events    (faker) ─┴─▶ iot_events (log, tiered)                          │
---                                                                                   ├─▶ datalake_device_telemetry   (per reading)
---                                                                                   └─▶ datalake_device_health_1min (1-min window)
---
--- The two datalake_* tables are what the tiering job (`make tiering`) moves into Iceberg.
 
 CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (
   'type' = 'fluss',
@@ -35,26 +34,39 @@ CREATE TABLE dim_device (
 );
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2) The raw streams. Both LOG tables (no PK).
+-- 2) The hot landing tables. Both LOG tables (no PK).
 --    Reading a PK table in streaming mode emits -U/+U, and an append-only sink
---    rejects that. Everything downstream here is append-only, so the sources
---    must be too. See docs/EXPLANATION.md.
+--    rejects that. Everything downstream here is append-only, so these must be too.
+--    See docs/EXPLANATION.md.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE iot_telemetry (
-  `reading_id`  BIGINT,
-  `device_id`   STRING NOT NULL,
-  `temperature` DOUBLE,
+  `reading_id`      BIGINT,
+  `device_id`       STRING NOT NULL,
+  `event_time`      TIMESTAMP(3),
+  `energy_usage`    DOUBLE,
+  `temperature`     DOUBLE,
+  `vibration`       DOUBLE,
+  `signal_strength` INT,
   `ptime` AS PROCTIME()
 );
 
 -- Tiered as well, so StarRocks can read events from the cold tier in Tutorial 3.
 -- No PK, for the same union-read reason as the datalake_* tables below.
+-- The type-specific columns are sparse: only the ones belonging to a row's
+-- event_type are populated, exactly as they arrive on the topic.
 CREATE TABLE iot_events (
-  `event_id`   STRING,
-  `device_id`  STRING NOT NULL,
-  `event_type` STRING,
-  `severity`   STRING,
-  `event_time` TIMESTAMP(3)
+  `device_id`   STRING NOT NULL,
+  `event_time`  TIMESTAMP(3),
+  `event_type`  STRING,
+  `severity`    STRING,
+  `error_code`  STRING,
+  `component`   STRING,
+  `root_cause`  STRING,
+  `technician`  STRING,
+  `duration_min` INT,
+  `parts_replaced` STRING,
+  `status`      STRING,
+  `next_inspection_days` INT
 ) WITH (
   'table.datalake.enabled' = 'true',
   'table.datalake.freshness' = '30s'
@@ -72,42 +84,56 @@ CREATE TABLE iot_events (
 
 -- Per-reading, enriched with the device's own threshold. Rows appear immediately,
 -- which is what makes the hot-vs-cold contrast visible within seconds.
+--
+-- In the reference lambda pipeline this is the point where anomalies were published
+-- back onto a THIRD Kafka topic and Routine-Loaded into StarRocks — a second copy,
+-- kept in sync by hand. Here the row is queryable the instant it lands and tiers
+-- itself into Iceberg. That is the whole argument; see docs/EXPLANATION.md.
 CREATE TABLE datalake_device_telemetry (
-  `reading_id`     BIGINT,
-  `device_id`      STRING NOT NULL,
-  `ingest_time`    TIMESTAMP(3),
-  `temperature`    DOUBLE,
-  `temp_threshold` DOUBLE,
-  `anomaly_flag`   BOOLEAN,
-  `location_id`    STRING,
-  `model`          STRING
+  `reading_id`      BIGINT,
+  `device_id`       STRING NOT NULL,
+  `event_time`      TIMESTAMP(3),
+  `ingest_time`     TIMESTAMP(3),
+  `energy_usage`    DOUBLE,
+  `temperature`     DOUBLE,
+  `vibration`       DOUBLE,
+  `signal_strength` INT,
+  `temp_threshold`  DOUBLE,
+  `anomaly_flag`    BOOLEAN,
+  `vibration_spike` BOOLEAN,
+  `location_id`     STRING,
+  `model`           STRING
 ) WITH (
   'table.datalake.enabled' = 'true',
   'table.datalake.freshness' = '30s'
 );
 
--- The analytical fact table — kappa's fact_telemetry_5min, at tutorial time-scale.
--- Dropped vs kappa: cnt_events / events_* (needs a stream-stream join) and the
--- incomplete_by_* flags (need event time + watermarks).
+-- The analytical fact table — the reference pipeline's fact_telemetry_5min, at
+-- tutorial time-scale. Dropped vs the original: cnt_events / events_* (needs a
+-- stream-stream join) and the incomplete_by_* flags (need event time + watermarks).
 -- ponytail: no event counts here; join iot_events at read time instead (sql/04).
 --
--- cnt_anomalies is what carries the signal. anomaly_flag is kappa's max()>threshold rule, kept
--- for parity, but over a full minute of uniform readings the max almost always clears the
--- threshold — so it is TRUE for nearly every window and ranks nothing. Rank on the anomaly
--- RATE (cnt_anomalies / cnt_points) instead; that tracks each device's threshold cleanly.
+-- cnt_anomalies is what carries the signal. anomaly_flag is the original's
+-- max()>threshold rule, kept for parity, but over a full minute of readings the max
+-- almost always clears the threshold — so it is TRUE for nearly every window and
+-- ranks nothing. Rank on the anomaly RATE (cnt_anomalies / cnt_points) instead.
 CREATE TABLE datalake_device_health_1min (
-  `device_id`       STRING NOT NULL,
-  `window_start`    TIMESTAMP(3),
-  `window_end`      TIMESTAMP(3),
-  `cnt_points`      BIGINT,
-  `cnt_anomalies`   BIGINT,
-  `avg_temperature` DOUBLE,
-  `min_temperature` DOUBLE,
-  `max_temperature` DOUBLE,
-  `threshold_used`  DOUBLE,
-  `anomaly_flag`    BOOLEAN,
-  `location_id`     STRING,
-  `model`           STRING
+  `device_id`        STRING NOT NULL,
+  `window_start`     TIMESTAMP(3),
+  `window_end`       TIMESTAMP(3),
+  `cnt_points`       BIGINT,
+  `cnt_anomalies`    BIGINT,
+  `cnt_vib_spikes`   BIGINT,
+  `avg_temperature`  DOUBLE,
+  `min_temperature`  DOUBLE,
+  `max_temperature`  DOUBLE,
+  `avg_energy_usage` DOUBLE,
+  `max_vibration`    DOUBLE,
+  `min_signal`       INT,
+  `threshold_used`   DOUBLE,
+  `anomaly_flag`     BOOLEAN,
+  `location_id`      STRING,
+  `model`            STRING
 ) WITH (
   'table.datalake.enabled' = 'true',
   'table.datalake.freshness' = '30s'
@@ -116,76 +142,94 @@ CREATE TABLE datalake_device_health_1min (
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4) Seed the dimension. dml-sync makes this block until it FINISHES, so the
 --    lookup joins below never start against an empty dimension.
---    Thresholds/locations/models are the same 11 devices as the kappa pipeline.
+--
+--    Thresholds are spread 24-29 °C across the 11 devices. The producer draws
+--    temperature uniformly from 18-30 °C, so device_1 (24.0) sits over its
+--    threshold about half the time and device_11 (29.0) about a twelfth — which is
+--    what makes the Tutorial 3 ranking come out ordered by threshold.
 -- ─────────────────────────────────────────────────────────────────────────────
 SET 'table.dml-sync' = 'true';
 
 INSERT INTO dim_device VALUES
-  ('device_1',  35.0, 'plant_a', 'Model-A', 'active'),
-  ('device_2',  34.0, 'plant_b', 'Model-A', 'active'),
-  ('device_3',  36.0, 'plant_c', 'Model-B', 'active'),
-  ('device_4',  33.0, 'plant_a', 'Model-B', 'active'),
-  ('device_5',  35.0, 'plant_b', 'Model-A', 'active'),
-  ('device_6',  37.0, 'plant_c', 'Model-C', 'active'),
-  ('device_7',  32.0, 'plant_a', 'Model-C', 'active'),
-  ('device_8',  38.0, 'plant_b', 'Model-D', 'active'),
-  ('device_9',  35.0, 'plant_c', 'Model-D', 'active'),
-  ('device_10', 34.5, 'plant_a', 'Model-B', 'active'),
-  ('device_11', 36.5, 'plant_b', 'Model-A', 'active');
+  ('device_1',  24.0, 'plant_a', 'Model-A', 'active'),
+  ('device_2',  24.5, 'plant_b', 'Model-A', 'active'),
+  ('device_3',  25.0, 'plant_c', 'Model-B', 'active'),
+  ('device_4',  25.5, 'plant_a', 'Model-B', 'active'),
+  ('device_5',  26.0, 'plant_b', 'Model-A', 'active'),
+  ('device_6',  26.5, 'plant_c', 'Model-C', 'active'),
+  ('device_7',  27.0, 'plant_a', 'Model-C', 'active'),
+  ('device_8',  27.5, 'plant_b', 'Model-D', 'active'),
+  ('device_9',  28.0, 'plant_c', 'Model-D', 'active'),
+  ('device_10', 28.5, 'plant_a', 'Model-B', 'active'),
+  ('device_11', 29.0, 'plant_b', 'Model-A', 'active');
 
 -- Back to detached: everything below should submit and return immediately.
 SET 'table.dml-sync' = 'false';
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 5) The sensors. flink-faker, straight into Fluss — no broker in this path.
+-- 5) The Kafka sources. This is the seam: Fluss sits BEHIND the broker you already
+--    have, it does not replace it.
 --
---    Fully qualified on purpose: an unqualified CREATE lands in whatever catalog
---    is current, and we are in fluss_catalog. Same reason as sql/05.
---
---    200k readings at 50/s ≈ 66 minutes. Bounded on purpose, but long enough that
---    the source does not drain mid-tutorial — every contrast in this repo only
---    exists while data is still arriving.
+--    'earliest-offset' so re-running this picks up everything already produced.
+--    'json.timestamp-format.standard' = 'ISO-8601' must match the producer — see the
+--    note in sql/07. 'json.ignore-parse-errors' keeps one malformed message from
+--    killing the job, which is what you want against a real topic.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`source_telemetry` (
-  `reading_id`  BIGINT,
+CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_telemetry` (
+  `reading_id`      BIGINT,
+  `device_id`       STRING,
+  `event_time`      TIMESTAMP(3),
+  `energy_usage`    DOUBLE,
+  `temperature`     DOUBLE,
+  `vibration`       DOUBLE,
+  `signal_strength` INT
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'iot-telemetry',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'streamhouse-telemetry',
+  'scan.startup.mode' = 'earliest-offset',
+  'format' = 'json',
+  'json.timestamp-format.standard' = 'ISO-8601',
+  'json.ignore-parse-errors' = 'true'
+);
+
+CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_events` (
   `device_id`   STRING,
-  `temperature` DOUBLE
+  `event_time`  TIMESTAMP(3),
+  `event_type`  STRING,
+  `severity`    STRING,
+  `error_code`  STRING,
+  `component`   STRING,
+  `root_cause`  STRING,
+  `technician`  STRING,
+  `duration_min` INT,
+  `parts_replaced` STRING,
+  `status`      STRING,
+  `next_inspection_days` INT
 ) WITH (
-  'connector' = 'faker',
-  'rows-per-second' = '50',
-  'number-of-rows' = '200000',
-  'fields.reading_id.expression'  = '#{number.numberBetween ''1'',''100000000''}',
-  'fields.device_id.expression'   = 'device_#{number.numberBetween ''1'',''12''}',
-  'fields.temperature.expression' = '#{number.randomDouble ''1'',''15'',''45''}'
-);
-
--- 15-45 °C against thresholds of 32-38 °C produces anomalies on its own — no need
--- to force a "hot device" the way the kappa generator does.
-
-CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`source_events` (
-  `event_id`   STRING,
-  `device_id`  STRING,
-  `event_type` STRING,
-  `severity`   STRING,
-  `event_time` TIMESTAMP(3)
-) WITH (
-  'connector' = 'faker',
-  'rows-per-second' = '5',
-  'number-of-rows' = '20000',
-  'fields.event_id.expression'   = '#{Internet.uuid}',
-  'fields.device_id.expression'  = 'device_#{number.numberBetween ''1'',''12''}',
-  'fields.event_type.expression' = '#{options.option ''failure'',''maintenance'',''inspection''}',
-  'fields.severity.expression'   = '#{options.option ''low'',''medium'',''high''}',
-  'fields.event_time.expression' = '#{date.past ''15'',''SECONDS''}'
+  'connector' = 'kafka',
+  'topic' = 'iot-events',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'streamhouse-events',
+  'scan.startup.mode' = 'earliest-offset',
+  'format' = 'json',
+  'json.timestamp-format.standard' = 'ISO-8601',
+  'json.ignore-parse-errors' = 'true'
 );
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 6) Ingest. Two detached Flink jobs.
+-- 6) Land the topics in Fluss. Two detached jobs.
+--    From here on the data is indexed and queryable — which it was not on the topic.
 -- ─────────────────────────────────────────────────────────────────────────────
 EXECUTE STATEMENT SET
 BEGIN
-  INSERT INTO iot_telemetry SELECT * FROM `default_catalog`.`default_database`.source_telemetry;
-  INSERT INTO iot_events    SELECT * FROM `default_catalog`.`default_database`.source_events;
+  INSERT INTO iot_telemetry
+  SELECT reading_id, device_id, event_time, energy_usage, temperature, vibration, signal_strength
+  FROM `default_catalog`.`default_database`.src_telemetry;
+
+  INSERT INTO iot_events
+  SELECT * FROM `default_catalog`.`default_database`.src_events;
 END;
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -195,7 +239,11 @@ END;
 CREATE TEMPORARY VIEW `default_catalog`.`default_database`.`enriched` AS
 SELECT t.reading_id,
        t.device_id,
+       t.event_time,
+       t.energy_usage,
        t.temperature,
+       t.vibration,
+       t.signal_strength,
        t.ptime,
        d.temp_threshold,
        d.location_id,
@@ -208,21 +256,27 @@ LEFT JOIN fluss_catalog.fluss.dim_device FOR SYSTEM_TIME AS OF t.ptime AS d
 -- 8) Derive both tiered tables. Two more detached jobs.
 --
 --    The window is PROCESSING time. A proctime tumble needs no watermark and emits
---    append-only, which is exactly what a log-table sink can consume. kappa used
---    event time because it simulated late data and outages; those are out of scope.
+--    append-only, which is exactly what a log-table sink can consume. The reference
+--    pipeline used event time because it simulated late data and outages; those are
+--    out of scope here.
 --    ponytail: proctime window; switch to event-time + WATERMARK when late data matters.
 --
---    1 minute, not kappa's 5 — so the fact table produces rows inside a tutorial.
+--    1 minute, not the original's 5 — so the fact table produces rows inside a tutorial.
 -- ─────────────────────────────────────────────────────────────────────────────
 EXECUTE STATEMENT SET
 BEGIN
   INSERT INTO datalake_device_telemetry
   SELECT reading_id,
          device_id,
+         event_time,
          CURRENT_TIMESTAMP,
+         energy_usage,
          temperature,
+         vibration,
+         signal_strength,
          temp_threshold,
          temperature > temp_threshold,
+         vibration > 3.0,
          location_id,
          `model`
   FROM `default_catalog`.`default_database`.enriched;
@@ -233,9 +287,13 @@ BEGIN
          window_end,
          count(*),
          sum(CASE WHEN temperature > temp_threshold THEN 1 ELSE 0 END),
+         sum(CASE WHEN vibration > 3.0 THEN 1 ELSE 0 END),
          avg(temperature),
          min(temperature),
          max(temperature),
+         avg(energy_usage),
+         max(vibration),
+         min(signal_strength),
          max(temp_threshold),
          max(temperature) > max(temp_threshold),
          max(location_id),
@@ -247,4 +305,4 @@ BEGIN
 END;
 
 -- Next:  make tiering     (start moving hot -> cold)
--- Then:  sql/09-iot-live.sql in this session, or `make demo` in another shell.
+-- Then:  sql/10-iot-live.sql in this session, or `make demo` in another shell.

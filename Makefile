@@ -18,8 +18,10 @@ up: jars
 verify:
 	bash scripts/verify.sh
 
+# Full reset. Includes the StarRocks overlay on purpose: StarRocks caches Iceberg metadata,
+# so a survivor of `down -v` serves manifest paths whose files no longer exist in MinIO.
 down:
-	docker compose down -v
+	docker compose -f docker-compose.yml -f docker-compose.starrocks.yml down -v
 
 ps:
 	docker compose ps
@@ -27,7 +29,8 @@ ps:
 logs:
 	docker compose logs -f coordinator-server tablet-server
 
-# Open the Flink SQL client. Tutorial 1: paste sql/07-iot-pipeline.sql.
+# Open the Flink SQL client. Tutorial 1: paste sql/07-iot-produce.sql, then sql/08 in a
+# second session.
 # Throwaway container per invocation, so concurrent sessions are fine.
 sql:
 	docker compose run --rm sql-client

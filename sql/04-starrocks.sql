@@ -1,6 +1,11 @@
 -- Tutorial 3: query the COLD tier from StarRocks.
 -- Connect:  mysql -h 127.0.0.1 -P 9030 -u root
 -- StarRocks reads the tiered Iceberg tables via Nessie's REST catalog — not Fluss directly.
+--
+-- "Location does not exist: s3://warehouse/..." means StarRocks is serving cached Iceberg
+-- metadata for files a reset deleted. `make down` now tears StarRocks down with everything
+-- else; if you reset some other way, refresh the table instead:
+--   REFRESH EXTERNAL TABLE iceberg_nessie.fluss.datalake_device_telemetry;
 
 CREATE EXTERNAL CATALOG IF NOT EXISTS iceberg_nessie
 PROPERTIES (
@@ -42,11 +47,20 @@ FROM datalake_device_health_1min
 GROUP BY device_id, location_id, model
 ORDER BY delta_over DESC;
 
--- 2) Events by type and severity (kappa panel 2). Also tiered, also cold.
+-- 2) Events by type and severity. Also tiered, also cold.
 SELECT event_type, severity, count(*) AS n
 FROM iot_events
 GROUP BY event_type, severity
 ORDER BY event_type, severity;
+
+-- 2b) The sparse columns survive the whole trip: producer -> Kafka JSON -> Fluss ->
+--     Iceberg -> StarRocks. Only failure rows carry a root_cause.
+SELECT root_cause, component, count(*) AS failures
+FROM iot_events
+WHERE event_type = 'failure'
+GROUP BY root_cause, component
+ORDER BY failures DESC
+LIMIT 10;
 
 -- 3) Devices ranked by how much time they spend over their own threshold (kappa panel 3).
 --    Rate, not anomaly_flag: over a full minute the max reading almost always clears the
@@ -56,7 +70,8 @@ SELECT device_id,
        max(threshold_used)                       AS threshold,
        count(*)                                  AS windows,
        sum(cnt_anomalies)                        AS anomalous_readings,
-       round(100.0 * sum(cnt_anomalies) / sum(cnt_points), 1) AS pct_over_threshold
+       round(100.0 * sum(cnt_anomalies) / sum(cnt_points), 1) AS pct_over_threshold,
+       sum(cnt_vib_spikes)                       AS vibration_spikes
 FROM datalake_device_health_1min
 GROUP BY device_id
 ORDER BY pct_over_threshold DESC;

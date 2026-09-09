@@ -42,16 +42,42 @@ whole argument. Kafka + Iceberg gets you a queryable copy only by making a secon
 
 ### What this replaces
 
-The reference point is a kappa-architecture IoT pipeline: Kafka → Spark Structured Streaming →
-StarRocks, with object storage holding checkpoints only. It works, and it has no lake. Every
-byte lives in the broker until the streaming job writes an aggregate into the serving database,
-so the raw history is retention-bound and the only queryable copy is the one the job chose to
-compute in advance.
+Two reference pipelines, same IoT domain, both the author's:
 
-The streamhouse version keeps the same shape — sensors, a dimension join, a windowed fact
-table, an OLAP engine on top — but the hot tier is queryable *and* it tiers itself into open
-Iceberg. Raw readings survive past retention, an engine that has never heard of Fluss can read
-them, and you do not have to decide in advance which aggregate you will need.
+**Kappa** — Kafka → Spark Structured Streaming → StarRocks, with object storage holding
+checkpoints only. No lake at all. Every byte lives in the broker until the streaming job writes
+an aggregate into the serving database, so raw history is retention-bound and the only queryable
+copy is the one the job decided in advance to compute.
+
+**Lambda (Mage)** — the one this repo's IoT tutorial is shaped after:
+
+```
+                        ┌─▶ Mage streaming ─▶ kafka: iot-anomalies ─▶ StarRocks (Routine Load)
+kafka: iot-telemetry ───┤
+kafka: iot-events    ───┴─▶ Mage ingestion ─▶ MinIO bronze ─▶ Mage batch ─▶ StarRocks
+```
+
+Count the copies of the same reading: one on the source topic, one on the anomalies topic, one
+in the StarRocks table the Routine Load maintains, one in bronze, one in whatever the batch path
+produces. Each is a separate job that can lag, fail, or drift, and the speed layer and batch
+layer have to be reconciled because they compute the same numbers by different routes.
+
+**The streamhouse version keeps the ingress and deletes the copies:**
+
+```
+kafka: iot-telemetry ───┬─▶ Fluss ──(queryable NOW)──┬─▶ Iceberg on MinIO ─▶ StarRocks
+kafka: iot-events    ───┘                            └─ same table, union read
+```
+
+Kafka stays — Fluss sits behind the broker rather than replacing it, which is why Tutorial 1
+ingests from topics rather than writing into Fluss directly. What goes away is the second and
+third copy. There is no anomalies topic, because the anomaly is a column on a row that is
+queryable the moment it lands. There is no Routine Load, because StarRocks reads the Iceberg
+table that Fluss tiers itself. And there is no speed-layer/batch-layer split to reconcile,
+because `SELECT ... FROM t` and `SELECT ... FROM t$lake` are the same table at two freshnesses,
+not two pipelines computing the same thing twice.
+
+That is the whole architectural claim. Tutorials 1-3 are its proof.
 
 ---
 
@@ -121,6 +147,30 @@ DROP TABLE fluss.<name>;
 ```
 
 Or just `make down`, which is the correct full reset.
+
+### JSON timestamps on Kafka need `ISO-8601`
+
+Python's `datetime.isoformat()` emits `2026-09-09T19:21:03.81` — with a `T`. Flink's JSON format
+defaults to `'json.timestamp-format.standard' = 'SQL'`, which expects `2026-09-09 19:21:03.81`
+with a space. On a mismatch it does not raise: the column arrives **NULL** and every other field
+parses fine, so the pipeline looks healthy and the timestamps are silently gone.
+
+`sql/07` sets it on the producer and `sql/08` on the consumer. Keep both if you swap the
+producer. `'json.ignore-parse-errors' = 'true'` on the consumer is the related decision: against
+a real topic one malformed message should not kill the job.
+
+### StarRocks caches Iceberg metadata
+
+An external Iceberg catalog in StarRocks caches manifest locations. Reset MinIO and Nessie
+underneath a running StarRocks and it will serve paths whose files no longer exist:
+
+```
+Location does not exist: s3://warehouse/fluss/datalake_device_telemetry_<uuid>/metadata/<...>.avro
+```
+
+`make down` therefore tears down the StarRocks overlay too — otherwise it survives a
+`docker compose down -v` that was issued against the base file alone. To recover without a full
+reset: `REFRESH EXTERNAL TABLE iceberg_nessie.fluss.<table>;`.
 
 ### The Fluss catalog ignores `CREATE TABLE IF NOT EXISTS`
 
@@ -208,8 +258,8 @@ demoing a drained source shows frozen numbers that look like a bug and are not o
 
 | Source | Rate | Rows | Window |
 |---|---|---|---|
-| `sql/07` `source_telemetry` | 50/s | 200,000 | ~66 min |
-| `sql/07` `source_events` | 5/s | 20,000 | ~66 min |
+| `sql/07` `gen_telemetry` → `iot-telemetry` | 50/s | 200,000 | ~66 min |
+| `sql/07` `gen_events` → `iot-events` | 5/s | 20,000 | ~66 min |
 | `sql/02` `source_order` (image built-in) | 10/s | 10,000 | ~16 min |
 | `sql/05` `bench_source` | 20,000/s | 20,000,000 | ~17 min |
 
@@ -222,11 +272,12 @@ Correct behaviour, no longer a contrast. Reset and start over.
 threshold_used` rule) and `cnt_anomalies` (how many readings in the window cleared the
 threshold). Only the second one is useful here.
 
-The faker draws temperatures uniformly from 15-45 °C, and a 1-minute window holds ~250 readings
-per device. The maximum of 250 uniform draws clears a 32-38 °C threshold essentially always, so
+The producer draws temperatures uniformly from 18-30 °C, and a 1-minute window holds ~250
+readings per device. The maximum of 250 uniform draws clears a 24-29 °C threshold always, so
 `anomaly_flag` is TRUE for nearly every window and ranks nothing — every device ties. The
-*rate*, `cnt_anomalies / cnt_points`, falls cleanly from 41.6% for device_7 (threshold 32.0 °C)
-to 20.6% for device_8 (38.0 °C), which is exactly the per-device threshold ordering.
+*rate*, `cnt_anomalies / cnt_points`, falls cleanly from 50.2% for device_1 (threshold 24.0 °C)
+to 7.1% for device_11 (29.0 °C), which is exactly the per-device threshold ordering — and
+matches the arithmetic, since temperature is uniform on 18-30 °C and (30-24)/12 = 50%.
 
 The flag is kept for parity with the reference pipeline, whose generator forced a genuinely hot
 device instead of drawing uniformly — with that input, `max() > threshold` does discriminate.
@@ -282,7 +333,7 @@ Kafka `9092` · StarRocks `9030` (+ `8030`, `8040`).
 - **Nessie is `IN_MEMORY`** — catalog state dies on `docker compose down`. For branch-lifecycle
   demos that survive restarts, switch to `nessie.version.store.type=ROCKSDB` with a mounted
   volume.
-- **Kafka is a Tutorial-4-only dependency.** Nothing else in the stack talks to it, and
-  `verify.sh` does not gate on it. The IoT pipeline writes straight into Fluss.
+- **Kafka is core now.** It is the ingress for Tutorial 1 as well as the foil in Tutorial 4, so
+  `verify.sh` gates on the broker alongside every other service.
 - **`verify.sh` is a liveness gate only.** It does not assert the Fluss→Iceberg tiering seam,
   which does not exist until `make tiering`.
