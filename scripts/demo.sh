@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Watch the cold tier chase the hot tier. Requires the stack up (`make up`), the pipeline from
-# sql/07-iot-pipeline.sql running, and the tiering job running (`make tiering`).
+# sql/07 + sql/08 running, and the tiering job running (`make tiering`).
 #
 # SQL_FILE overrides which contrast to loop:
 #   SQL_FILE=/sql/03-contrast.sql bash scripts/demo.sh   # the orders appendix
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 ITERATIONS="${1:-6}"
-SQL_FILE="${SQL_FILE:-/sql/08-iot-contrast.sql}"
+SQL_FILE="${SQL_FILE:-/sql/09-iot-contrast.sql}"
 
 for ((i = 1; i <= ITERATIONS; i++)); do
   printf '\n═══ %s  (%d/%d) ═══\n' "$(date +%H:%M:%S)" "$i" "$ITERATIONS"

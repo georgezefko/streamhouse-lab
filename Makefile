@@ -29,7 +29,8 @@ ps:
 logs:
 	docker compose logs -f coordinator-server tablet-server
 
-# Open the Flink SQL client. Tutorial 1: paste sql/07-iot-pipeline.sql.
+# Open the Flink SQL client. Tutorial 1: paste sql/07-iot-produce.sql, then sql/08 in a
+# second session.
 # Throwaway container per invocation, so concurrent sessions are fine.
 sql:
 	docker compose run --rm sql-client
