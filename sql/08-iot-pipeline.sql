@@ -1,12 +1,13 @@
--- Tutorial 1: a real-time IoT analytics pipeline on the streamhouse.
+-- Tutorial 1, step 2: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
 --
---   sensors ─┬─▶ iot_telemetry (log) ──lookup join dim_device──▶ enriched ─┬─▶ datalake_device_telemetry   (per reading)
---            └─▶ iot_events (log, tiered)                                  └─▶ datalake_device_health_1min (1-min window)
+--   kafka: iot-telemetry ─┐
+--                         ├─▶ iot_telemetry (log) ──lookup join dim_device──▶ enriched
+--   kafka: iot-events   ──┴─▶ iot_events (log, tiered)                          │
+--                                                                               ├─▶ datalake_device_telemetry   (per reading)
+--                                                                               └─▶ datalake_device_health_1min (1-min window)
 --
--- There is no broker in this path, on purpose. iot_telemetry is a Fluss LOG table: an
--- append-only stream, partitioned and replicated, which is the job a Kafka topic would
--- normally do here — except you can also query it, join it, and tier it. Tutorial 4 prices
--- exactly that difference.
+-- Requires the topics to exist — run sql/07-iot-produce.sql first, or point your own
+-- producer at iot-telemetry / iot-events.
 --
 -- Paste this whole file into an interactive session:  make sql
 
@@ -34,14 +35,9 @@ CREATE TABLE dim_device (
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2) The hot landing tables. Both LOG tables (no PK).
---
---    A Fluss log table is an append-only, partitioned, replicated stream — the same
---    shape as a Kafka topic, and it is deliberately the only "queue" in this pipeline.
---    The difference is that this one has a schema, joins, and a SELECT.
---
---    No PK for a second reason too: reading a PK table in streaming mode emits -U/+U,
---    and an append-only sink rejects that. Everything downstream here is append-only,
---    so these must be too. See docs/EXPLANATION.md.
+--    Reading a PK table in streaming mode emits -U/+U, and an append-only sink
+--    rejects that. Everything downstream here is append-only, so these must be too.
+--    See docs/EXPLANATION.md.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE iot_telemetry (
   `reading_id`      BIGINT,
@@ -56,8 +52,8 @@ CREATE TABLE iot_telemetry (
 
 -- Tiered as well, so StarRocks can read events from the cold tier in Tutorial 3.
 -- No PK, for the same union-read reason as the datalake_* tables below.
--- The type-specific columns are a sparse union: only the ones belonging to a row's
--- event_type are populated, the rest are NULL.
+-- The type-specific columns are sparse: only the ones belonging to a row's
+-- event_type are populated, exactly as they arrive on the topic.
 CREATE TABLE iot_events (
   `device_id`   STRING NOT NULL,
   `event_time`  TIMESTAMP(3),
@@ -90,9 +86,9 @@ CREATE TABLE iot_events (
 -- which is what makes the hot-vs-cold contrast visible within seconds.
 --
 -- In the reference lambda pipeline this is the point where anomalies were published
--- onto a second Kafka topic and Routine-Loaded into StarRocks — another copy, kept in
--- sync by hand. Here the row is queryable the instant it lands and tiers itself into
--- Iceberg. That is the whole argument; see docs/EXPLANATION.md.
+-- back onto a THIRD Kafka topic and Routine-Loaded into StarRocks — a second copy,
+-- kept in sync by hand. Here the row is queryable the instant it lands and tiers
+-- itself into Iceberg. That is the whole argument; see docs/EXPLANATION.md.
 CREATE TABLE datalake_device_telemetry (
   `reading_id`      BIGINT,
   `device_id`       STRING NOT NULL,
@@ -147,7 +143,7 @@ CREATE TABLE datalake_device_health_1min (
 -- 4) Seed the dimension. dml-sync makes this block until it FINISHES, so the
 --    lookup joins below never start against an empty dimension.
 --
---    Thresholds are spread 24-29 °C across the 11 devices. The generator draws
+--    Thresholds are spread 24-29 °C across the 11 devices. The producer draws
 --    temperature uniformly from 18-30 °C, so device_1 (24.0) sits over its
 --    threshold about half the time and device_11 (29.0) about a twelfth — which is
 --    what makes the Tutorial 3 ranking come out ordered by threshold.
@@ -171,45 +167,37 @@ INSERT INTO dim_device VALUES
 SET 'table.dml-sync' = 'false';
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 5) The sensors. flink-faker, straight into Fluss.
+-- 5) The Kafka sources. This is the seam: Fluss sits BEHIND the broker you already
+--    have, it does not replace it.
 --
---    Fully qualified on purpose: an unqualified CREATE lands in whatever catalog is
---    current, and we are in fluss_catalog. Same reason as sql/05.
---
---    200k readings at 50/s ≈ 66 minutes. Bounded on purpose, but long enough that the
---    source does not drain mid-tutorial — every contrast in this repo only exists while
---    data is still arriving.
---
---    Field ranges follow a real device fleet: temperature 18-30 °C, vibration 0.1-2.0
---    with occasional spikes, energy 0.5-5.0, signal 70-100.
+--    'earliest-offset' so re-running this picks up everything already produced.
+--    'json.timestamp-format.standard' = 'ISO-8601' must match the producer — see the
+--    note in sql/07. 'json.ignore-parse-errors' keeps one malformed message from
+--    killing the job, which is what you want against a real topic.
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`gen_telemetry` (
+CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_telemetry` (
   `reading_id`      BIGINT,
   `device_id`       STRING,
   `event_time`      TIMESTAMP(3),
   `energy_usage`    DOUBLE,
   `temperature`     DOUBLE,
-  `vibration_base`  DOUBLE,
-  `spike_roll`      DOUBLE,
+  `vibration`       DOUBLE,
   `signal_strength` INT
 ) WITH (
-  'connector' = 'faker',
-  'rows-per-second' = '50',
-  'number-of-rows' = '200000',
-  'fields.reading_id.expression'      = '#{number.numberBetween ''1'',''100000000''}',
-  'fields.device_id.expression'       = 'device_#{number.numberBetween ''1'',''12''}',
-  'fields.event_time.expression'      = '#{date.past ''5'',''SECONDS''}',
-  'fields.energy_usage.expression'    = '#{number.randomDouble ''2'',''0'',''5''}',
-  'fields.temperature.expression'     = '#{number.randomDouble ''1'',''18'',''30''}',
-  'fields.vibration_base.expression'  = '#{number.randomDouble ''1'',''0'',''2''}',
-  'fields.spike_roll.expression'      = '#{number.randomDouble ''2'',''0'',''1''}',
-  'fields.signal_strength.expression' = '#{number.numberBetween ''70'',''100''}'
+  'connector' = 'kafka',
+  'topic' = 'iot-telemetry',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'streamhouse-telemetry',
+  'scan.startup.mode' = 'earliest-offset',
+  'format' = 'json',
+  'json.timestamp-format.standard' = 'ISO-8601',
+  'json.ignore-parse-errors' = 'true'
 );
 
-CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`gen_events` (
+CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_events` (
   `device_id`   STRING,
   `event_time`  TIMESTAMP(3),
-  `type_roll`   DOUBLE,
+  `event_type`  STRING,
   `severity`    STRING,
   `error_code`  STRING,
   `component`   STRING,
@@ -220,53 +208,28 @@ CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`gen_events` (
   `status`      STRING,
   `next_inspection_days` INT
 ) WITH (
-  'connector' = 'faker',
-  'rows-per-second' = '5',
-  'number-of-rows' = '20000',
-  'fields.device_id.expression'    = 'device_#{number.numberBetween ''1'',''12''}',
-  'fields.event_time.expression'   = '#{date.past ''5'',''SECONDS''}',
-  'fields.type_roll.expression'    = '#{number.randomDouble ''3'',''0'',''1''}',
-  'fields.severity.expression'     = '#{options.option ''low'',''medium'',''high''}',
-  'fields.error_code.expression'   = 'ERR#{number.numberBetween ''1000'',''1999''}',
-  'fields.component.expression'    = '#{options.option ''motor'',''bearing'',''sensor'',''battery''}',
-  'fields.root_cause.expression'   = '#{options.option ''overheating'',''wear'',''power_surge'',''unknown''}',
-  'fields.technician.expression'   = 'tech-#{number.numberBetween ''1'',''20''}',
-  'fields.duration_min.expression' = '#{number.numberBetween ''15'',''240''}',
-  'fields.parts_replaced.expression' = '#{options.option ''bearing'',''filter'',''battery''}',
-  'fields.status.expression'       = '#{options.option ''passed'',''passed'',''failed''}',
-  'fields.next_inspection_days.expression' = '#{number.numberBetween ''7'',''30''}'
+  'connector' = 'kafka',
+  'topic' = 'iot-events',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'streamhouse-events',
+  'scan.startup.mode' = 'earliest-offset',
+  'format' = 'json',
+  'json.timestamp-format.standard' = 'ISO-8601',
+  'json.ignore-parse-errors' = 'true'
 );
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 6) Ingest. Two detached jobs. From here the data is indexed and queryable.
+-- 6) Land the topics in Fluss. Two detached jobs.
+--    From here on the data is indexed and queryable — which it was not on the topic.
 -- ─────────────────────────────────────────────────────────────────────────────
 EXECUTE STATEMENT SET
 BEGIN
-  -- Vibration spikes ~5% of the time.
   INSERT INTO iot_telemetry
-  SELECT reading_id, device_id, event_time, energy_usage, temperature,
-         round(vibration_base + CASE WHEN spike_roll > 0.95 THEN 3.0 ELSE 0.0 END, 1),
-         signal_strength
-  FROM `default_catalog`.`default_database`.gen_telemetry;
+  SELECT reading_id, device_id, event_time, energy_usage, temperature, vibration, signal_strength
+  FROM `default_catalog`.`default_database`.src_telemetry;
 
-  -- 10% failure / 30% maintenance / 60% inspection, and only the columns that belong
-  -- to each type are populated — the rest stay NULL.
   INSERT INTO iot_events
-  SELECT device_id,
-         event_time,
-         CASE WHEN type_roll < 0.10 THEN 'failure'
-              WHEN type_roll < 0.40 THEN 'maintenance'
-              ELSE 'inspection' END,
-         severity,
-         CASE WHEN type_roll < 0.10 THEN error_code  END,
-         CASE WHEN type_roll < 0.10 THEN component   END,
-         CASE WHEN type_roll < 0.10 THEN root_cause  END,
-         CASE WHEN type_roll >= 0.10 AND type_roll < 0.40 THEN technician     END,
-         CASE WHEN type_roll >= 0.10 AND type_roll < 0.40 THEN duration_min   END,
-         CASE WHEN type_roll >= 0.10 AND type_roll < 0.40 THEN parts_replaced END,
-         CASE WHEN type_roll >= 0.40 THEN status               END,
-         CASE WHEN type_roll >= 0.40 THEN next_inspection_days END
-  FROM `default_catalog`.`default_database`.gen_events;
+  SELECT * FROM `default_catalog`.`default_database`.src_events;
 END;
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -342,4 +305,4 @@ BEGIN
 END;
 
 -- Next:  make tiering     (start moving hot -> cold)
--- Then:  sql/09-iot-live.sql in this session, or `make demo` in another shell.
+-- Then:  sql/10-iot-live.sql in this session, or `make demo` in another shell.

@@ -42,7 +42,7 @@ x-flink-iceberg-vols: &flink-iceberg-vols
   - ./lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar
   - ./lib/failsafe-3.3.2.jar:/opt/flink/lib/failsafe-3.3.2.jar
   - ./lib/iceberg-flink-runtime-1.20-1.10.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.20-1.10.1.jar
-  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # Tutorial 4 only
+  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # Tutorials 1 and 4
   - ./sql:/sql   # so `sql-client -f /sql/03-contrast.sql` can run non-interactively
 
 services:
@@ -179,7 +179,7 @@ services:
         datalake.iceberg.client.region: us-east-1
     volumes: *fluss-iceberg-vols
 
-  # ---------- Kafka (Tutorial 4 only: the "you cannot query a log" comparison) ----------
+  # ---------- Kafka: ingress for Tutorial 1, and the "you cannot query a log" contrast in Tutorial 4 ----------
   # Single-node KRaft, no ZooKeeper. Nothing else in the stack depends on it; it exists purely
   # to hold the same volume of orders as Fluss so the point-lookup costs are comparable.
   kafka:
@@ -198,6 +198,23 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+  # Optional Python stand-in for the device fleet — the same two topics and the same
+  # JSON as sql/07-iot-produce.sql, for when the ingress should look like a real
+  # producer. Run this OR sql/07, not both.  `make produce`
+  # No Dockerfile on purpose: this stays a compose lab with nothing to build.
+  iot-producer:
+    image: python:3.12-slim
+    profiles: ["producer"]
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      RATE: ${RATE:-50}          # telemetry rows/s
+      ROWS: ${ROWS:-200000}      # 0 = run forever
+    volumes:
+      - ./scripts:/scripts:ro
+    command: sh -c "pip install -q confluent-kafka && python -u /scripts/iot_producer.py"
 
   # ---------- Flink (compute + SQL client) ----------
   # Image bundles the Fluss Flink connector, flink-faker (demo data), and S3 filesystem support.

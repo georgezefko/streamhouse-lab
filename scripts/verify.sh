@@ -61,7 +61,7 @@ check_completed() {
 # Give the cluster a moment to settle before asserting (Fluss + Flink take ~20-40s).
 retry 60 bash -c "$DC ps -q coordinator-server | grep -q ." || true
 
-for svc in minio nessie zookeeper coordinator-server tablet-server jobmanager taskmanager; do
+for svc in minio nessie zookeeper coordinator-server tablet-server jobmanager taskmanager kafka; do
   check_running "$svc"
 done
 check_completed minio-init
@@ -99,6 +99,18 @@ if retry 60 tm_registered; then
   pass "Flink  ${DIM}:8083 (taskmanager registered)${RESET}"
 else
   fail "Flink" "no taskmanager registered with jobmanager"
+fi
+
+# Kafka broker accepting API requests. Kafka is the ingress for Tutorial 1 (sql/07 produces
+# onto iot-telemetry / iot-events), so a dead broker means the pipeline silently reads nothing.
+kafka_ready() {
+  $DC exec -T kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
+    --bootstrap-server kafka:9092 >/dev/null 2>&1
+}
+if retry 60 kafka_ready; then
+  pass "Kafka  ${DIM}:9092 (broker responding)${RESET}"
+else
+  fail "Kafka" ":9092 not accepting requests — Tutorial 1 has no ingress"
 fi
 
 # ── 3. Buckets exist ───────────────────────────────────────────────────────────
