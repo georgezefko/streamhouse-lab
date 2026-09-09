@@ -15,7 +15,8 @@ enriched table + a 1-minute windowed fact table, both tiered to Iceberg, read by
 
 Kafka is the **ingress for the main tutorial**, not a Tutorial-4-only dependency any more.
 `sql/07` is only a stand-in producer: swap in any producer on the same topics with the same
-field names and `sql/08` onward is unchanged. It mirrors the author's Mage/lambda pipeline
+field names and `sql/08` onward is unchanged. `scripts/iot_producer.py` (`make produce`) is
+exactly that swap, in Python — an alternative to `sql/07`, never run alongside it. It mirrors the author's Mage/lambda pipeline
 (Kafka → Mage → a second Kafka topic → StarRocks Routine Load), with the second copy removed.
 
 Two claims the repo exists to demonstrate:
@@ -35,6 +36,7 @@ EXPLANATION with a link from the README, not inline.
 make up          # jars + whole stack + verify gate
 make verify      # liveness gate (containers, endpoints, TM registration, buckets)
 make sql         # interactive Flink SQL client; paste sql/*.sql by hand
+make produce     # Tutorial 1 ingress as a Python producer instead of sql/07 (run one, not both)
 make tiering     # submit the Fluss→Iceberg tiering job
 make demo        # Tutorial 2: loops sql/09-iot-contrast.sql
 make demo-orders # same, on the orders appendix (SQL_FILE=/sql/03-contrast.sql)

@@ -35,6 +35,13 @@ logs:
 sql:
 	docker compose run --rm sql-client
 
+# Tutorial 1 — a Python producer as the ingress instead of sql/07-iot-produce.sql.
+# Run this OR sql/07, never both: same topics, so both together means double the data.
+# `RATE=200 ROWS=0 make produce` to override.
+produce:
+	docker compose --profile producer up -d iot-producer
+	@echo "producing to iot-telemetry / iot-events — docker compose logs -f iot-producer"
+
 # Tutorial 1 — start the Fluss -> Iceberg tiering job (after the tables exist)
 tiering:
 	bash scripts/start-tiering.sh

@@ -54,7 +54,7 @@ leaves Flink jobs running in the background.
 | # | Command | Blocks? | Result |
 |---|---|---|---|
 | 1 | `make up` | ~2 min (+pulls) | whole stack up; ends with the `verify.sh` gate |
-| 2 | `make sql`, paste `sql/07-iot-produce.sql` | no | 2 jobs publishing to Kafka, ~66 min of sensor data |
+| 2 | `make sql`, paste `sql/07-iot-produce.sql` &nbsp;*or*&nbsp; `make produce` | no | 2 jobs publishing to Kafka, ~66 min of sensor data |
 | 3 | `make sql`, paste `sql/08-iot-pipeline.sql` | no | 5 Fluss tables, 4 detached jobs |
 | 4 | `make tiering` | no | tiering job appears in the Flink UI |
 | 5 | `make demo` | ~90 s | the hot-vs-cold contrast |
@@ -101,6 +101,10 @@ everything else queries.
 ```bash
 make sql                          # paste sql/07-iot-produce.sql
 ```
+
+Prefer a producer that looks like a producer? `make produce` runs `scripts/iot_producer.py` in a
+container instead — a `confluent-kafka` fleet on the same two topics, same JSON, same rates, so
+`sql/08` onward is unchanged. Run one or the other, never both, or you get double the data.
 
 Two detached jobs publish JSON to `iot-telemetry` and `iot-events`, keyed on nothing in
 particular and shaped exactly like a real device fleet would send it:
@@ -477,6 +481,7 @@ else.
 | `scripts/demo.sh` | loops a contrast query; `SQL_FILE=` picks which |
 | `scripts/bench.sh` | runs `sql/06`, reads job durations from the Flink REST API |
 | `sql/07-iot-produce.sql` | **Tutorial 1** — sensors → the Kafka topics (swap in your own producer) |
+| `scripts/iot_producer.py` | **Tutorial 1** — the same sensors in Python (`make produce`), an alternative to `sql/07` |
 | `sql/08-iot-pipeline.sql` | **Tutorial 1** — Kafka → Fluss → the two tiered tables |
 | `sql/09-iot-contrast.sql` | **Tutorial 2** — hot vs cold, `-f`-safe (what `make demo` loops) |
 | `sql/10-iot-live.sql` | **Tutorial 2** — live queries, interactive only |
