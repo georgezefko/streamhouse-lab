@@ -1,4 +1,4 @@
-.PHONY: jars up verify down ps logs sql tiering demo bench starrocks sr-sql clean
+.PHONY: jars up verify down ps logs sql tiering demo demo-orders bench starrocks sr-sql clean
 
 # Setup — fetch Fluss server-side Iceberg jars (run once)
 jars:
@@ -18,8 +18,10 @@ up: jars
 verify:
 	bash scripts/verify.sh
 
+# Full reset. Includes the StarRocks overlay on purpose: StarRocks caches Iceberg metadata,
+# so a survivor of `down -v` serves manifest paths whose files no longer exist in MinIO.
 down:
-	docker compose down -v
+	docker compose -f docker-compose.yml -f docker-compose.starrocks.yml down -v
 
 ps:
 	docker compose ps
@@ -27,29 +29,36 @@ ps:
 logs:
 	docker compose logs -f coordinator-server tablet-server
 
-# Open the Flink SQL client (paste from sql/01-tables.sql then sql/02-ingest-and-query.sql)
+# Open the Flink SQL client. Tutorial 1: paste sql/07-iot-pipeline.sql.
+# Throwaway container per invocation, so concurrent sessions are fine.
 sql:
 	docker compose run --rm sql-client
 
-# Scenario 2 — start the Fluss -> Iceberg tiering job (after tables exist)
+# Tutorial 1 — start the Fluss -> Iceberg tiering job (after the tables exist)
 tiering:
 	bash scripts/start-tiering.sh
 
-# Scenario 2 payoff — hot vs cold, side by side. Needs the tiering job already running.
+# Tutorial 2 — hot vs cold, side by side. Needs the tiering job already running.
 # `make demo N=12` for more iterations.
 demo:
 	bash scripts/demo.sh $(N)
 
-# Scenario 3 — StarRocks over the cold tier
+# The same contrast on the orders appendix (sql/01-03).
+demo-orders:
+	SQL_FILE=/sql/03-contrast.sql bash scripts/demo.sh $(N)
+
+# Tutorial 3 — StarRocks over the cold tier
 starrocks:
 	docker compose -f docker-compose.yml -f docker-compose.starrocks.yml up -d starrocks
 	@echo "StarRocks (MySQL protocol)  mysql -h 127.0.0.1 -P 9030 -u root"
 
+# Needs a mysql client ON THE HOST (the devcontainer has one; a bare macOS shell may not).
+# Without it:  docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root
 sr-sql:
 	mysql -h 127.0.0.1 -P 9030 -u root
 
-# Scenario 4 — point-lookup cost: Fluss vs Kafka vs Iceberg.
-# Needs sql/05-bench-load.sql running in `make sql` and the tiering job up.
+# Tutorial 4 — point-lookup cost: Fluss vs Kafka. Nothing here is tiered.
+# Needs sql/05-bench-load.sql still loading in a `make sql` session.
 bench:
 	bash scripts/bench.sh
 

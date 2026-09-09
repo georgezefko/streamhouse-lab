@@ -1,4 +1,4 @@
--- Scenario 4: the same question asked of two engines.
+-- Tutorial 4: the same question asked of two engines.
 --   "What is order 424242?"
 -- Fluss answers it with a primary-key point lookup. Kafka has no index, so Flink reads the
 -- topic from earliest to latest offset.
