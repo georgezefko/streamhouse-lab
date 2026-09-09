@@ -5,15 +5,16 @@ tiering continuously into **Apache Iceberg on MinIO**, cataloged by **Nessie**, 
 **StarRocks** as an optional OLAP engine over the cold tier. Compute is **Apache Flink 1.20**.
 
 ```
- sensors ──▶ Kafka ──▶ Fluss (hot: PK + log tables) ──tiering job──▶ Iceberg on MinIO ──▶ StarRocks
-             topics          │                                            ▲   (cold)
-                             └────────────── union read ──────────────────┘
-                          (query the table = hot ∪ cold;  table$lake = cold only)
+ sensors ──▶ Fluss (hot: PK + log tables) ──tiering job──▶ Iceberg on MinIO ──▶ StarRocks
+                  │                                            ▲   (cold)
+                  └───────────────union read ──────────────────┘
+               (query the table = hot ∪ cold;  table$lake = cold only)
 ```
 
-Sensors publish JSON to the Kafka topics `iot-telemetry` and `iot-events`; Flink lands them in
-Fluss, which is queryable immediately and tiers itself into Iceberg. **Kafka stays** — Fluss sits
-behind the broker you already have rather than replacing it.
+**There is no broker in that path, deliberately.** A Fluss *log table* is an append-only,
+partitioned, replicated stream — the job a Kafka topic would normally do — except it also has a
+schema, joins, and a `SELECT`. Tutorial 1 lands sensor readings straight into one; Tutorial 4
+prices exactly what the difference is worth.
 
 The tutorials below build a **real-time IoT analytics pipeline** on it — sensors, a device
 dimension, anomaly detection, a windowed fact table, a dashboard engine — and then show the two
@@ -54,12 +55,11 @@ leaves Flink jobs running in the background.
 | # | Command | Blocks? | Result |
 |---|---|---|---|
 | 1 | `make up` | ~2 min (+pulls) | whole stack up; ends with the `verify.sh` gate |
-| 2 | `make sql`, paste `sql/07-iot-produce.sql` | no | 2 jobs publishing to Kafka, ~66 min of sensor data |
-| 3 | `make sql`, paste `sql/08-iot-pipeline.sql` | no | 5 Fluss tables, 4 detached jobs |
-| 4 | `make tiering` | no | tiering job appears in the Flink UI |
-| 5 | `make demo` | ~90 s | the hot-vs-cold contrast |
+| 2 | `make sql`, paste `sql/07-iot-pipeline.sql` | no | 5 tables, 4 detached jobs, ~66 min of sensor data |
+| 3 | `make tiering` | no | tiering job appears in the Flink UI |
+| 4 | `make demo` | ~90 s | the hot-vs-cold contrast |
 
-Then `sql/10-iot-live.sql` for live queries (Tutorial 2), `make starrocks` (Tutorial 3), and
+Then `sql/09-iot-live.sql` for live queries (Tutorial 2), `make starrocks` (Tutorial 3), and
 `make bench` (Tutorial 4).
 
 UIs: Flink [`:8083`](http://localhost:8083) · MinIO console [`:9001`](http://localhost:9001)
@@ -93,67 +93,34 @@ assert the Fluss→Iceberg tiering seam, which does not exist until `make tierin
 
 ## Tutorial 1 — a real-time IoT pipeline on the streamhouse
 
-**Builds:** sensors → Kafka → Fluss → two tiered tables → Iceberg. This is the pipeline
-everything else queries.
-
-### Step 1 — put sensor data on Kafka
+**Builds:** sensors → Fluss → two tiered tables → Iceberg. This is the pipeline everything else
+queries, and it has no queue in front of it.
 
 ```bash
-make sql                          # paste sql/07-iot-produce.sql
-```
-
-Two detached jobs publish JSON to `iot-telemetry` and `iot-events`, keyed on nothing in
-particular and shaped exactly like a real device fleet would send it:
-
-```json
-{"reading_id":19974442,"device_id":"device_9","event_time":"2026-09-09T19:21:03.81",
- "energy_usage":1.19,"temperature":22.6,"vibration":0.9,"signal_strength":70}
-
-{"device_id":"device_11","event_time":"2026-09-09T19:21:03.032","event_type":"failure",
- "severity":"low","error_code":"ERR1221","component":"bearing","root_cause":"unknown",
- "technician":null,"duration_min":null,"parts_replaced":null,
- "status":null,"next_inspection_days":null}
-```
-
-Events are a **sparse union**: only the fields belonging to a row's `event_type` are populated
-(failures carry `error_code`/`component`/`root_cause`, maintenance carries
-`technician`/`duration_min`/`parts_replaced`, inspections carry `status`/`next_inspection_days`).
-Type mix is 10% failure / 30% maintenance / 60% inspection.
-
-Check it landed:
-
-```bash
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server kafka:9092 --topic iot-telemetry --from-beginning --max-messages 2
-```
-
-**Swapping in your own producer:** nothing downstream knows flink-faker is behind this. Point
-any producer at the same two topics with the same field names and Step 2 is unchanged — the
-footer of `sql/07` shows the mapping for a `confluent-kafka` Python producer. Keep timestamps
-ISO-8601.
-
-### Step 2 — land it in Fluss and tier it
-
-```bash
-make sql                          # second session: paste sql/08-iot-pipeline.sql
+make sql                          # paste sql/07-iot-pipeline.sql, all of it
 make tiering                      # then start moving hot -> cold
 ```
 
-What `sql/08` creates:
+What the file creates:
 
 | Table | Kind | Tiered | Role |
 |---|---|---|---|
 | `dim_device` | **PK** on `device_id` | no | 11 devices with per-device temperature thresholds; the lookup-join build side |
-| `iot_telemetry` | log | no | raw readings off `iot-telemetry`, 50/s |
-| `iot_events` | log | **yes** | off `iot-events`; the sparse type-specific columns land as-is |
+| `iot_telemetry` | log | no | raw readings, 50/s — the append-only stream a topic would otherwise hold |
+| `iot_events` | log | **yes** | failure / maintenance / inspection, with sparse type-specific columns |
 | `datalake_device_telemetry` | log | **yes** | every reading, enriched with its device's threshold + `anomaly_flag` + `vibration_spike` |
 | `datalake_device_health_1min` | log | **yes** | the fact table: 1-minute windows per device — reading count, anomaly count, avg/min/max temp |
 
-The pipeline is four detached Flink jobs: two reading Kafka into Fluss, two deriving. The derive
+The pipeline is four detached Flink jobs: two ingest, two derive. The derive
 side does a **lookup join** — one point lookup against `dim_device` per incoming reading — and
 then fans the result into a per-reading table and a windowed aggregate.
 
-Thresholds are spread 24.0–29.0 °C across the eleven devices while the producer draws
+`iot_events` rows are a **sparse union**: only the fields belonging to a row's `event_type` are
+populated (failures carry `error_code`/`component`/`root_cause`, maintenance carries
+`technician`/`duration_min`/`parts_replaced`, inspections carry `status`/`next_inspection_days`),
+at a mix of 10% / 30% / 60%. Tutorial 3 shows that sparseness surviving all the way to StarRocks.
+
+Thresholds are spread 24.0–29.0 °C across the eleven devices while the generator draws
 temperature uniformly from 18–30 °C, so each device sits over its own threshold a different and
 predictable fraction of the time. That is what makes Tutorial 3's ranking mean something.
 
@@ -177,15 +144,8 @@ predictable fraction of the time. That is what makes Tutorial 3's ranking mean s
   `iot_telemetry` must be append-only.
   [Why](docs/EXPLANATION.md#a-log-table-sink-cannot-consume-a-pk-tables-changelog).
 - *`temp_threshold` all NULL* — the `dim_device` seed did not finish before the derive jobs
-  started. `sql/08` uses `SET 'table.dml-sync' = 'true'` around the seed to prevent exactly
+  started. `sql/07` uses `SET 'table.dml-sync' = 'true'` around the seed to prevent exactly
   this; if you pasted statements out of order, re-run the seed.
-- *every `event_time` is NULL, everything else populated* — a JSON timestamp-format mismatch.
-  Python's `datetime.isoformat()` writes `2026-09-09T19:21:03.81` with a `T`; Flink's JSON
-  format defaults to `SQL`, which wants a space, and yields NULL rather than an error. Both
-  `sql/07` and `sql/08` set `'json.timestamp-format.standard' = 'ISO-8601'`; keep it if you
-  swap the producer.
-- *zero rows in `iot_telemetry`, jobs RUNNING* — nothing is on the topic. Run Step 1 first, or
-  check `make verify` shows Kafka green.
 - *`datalake_device_health_1min` stays empty past 2 minutes* — check the second derive job's
   *Exceptions* tab in the Flink UI.
 
@@ -199,7 +159,7 @@ hot + cold, the `$lake` suffix reads cold only.
 ### Live, in an interactive session
 
 ```bash
-make sql                          # paste sql/10-iot-live.sql
+make sql                          # paste sql/09-iot-live.sql
 ```
 
 Section A runs in **streaming** mode with `result-mode = table`: a feed of readings over
@@ -216,7 +176,7 @@ sessions are fine — `make sql` runs a throwaway container each time.
 make demo                         # `make demo N=12` for more iterations
 ```
 
-`make demo` loops `sql/09-iot-contrast.sql` and prints:
+`make demo` loops `sql/08-iot-contrast.sql` and prints:
 
 ```
 +---------------+-----------+------------------+
@@ -325,8 +285,7 @@ thresholds were resolved by a lookup join in Flink, tiered to Iceberg, and it ne
 Fluss on the way out.
 
 Panel 2b is the other half of the point: `root_cause` and `component` are populated only on
-`failure` rows, and that sparseness survives producer → Kafka JSON → Fluss → Iceberg →
-StarRocks intact.
+`failure` rows, and that sparseness survives Flink → Fluss → Iceberg → StarRocks intact.
 
 Then the freshness half:
 
@@ -364,8 +323,8 @@ records over the same key space. Asking one question of each costs wildly differ
 This one is standalone — it uses its own orders dataset and does not touch the IoT pipeline.
 It needs a **second SQL client session** alongside anything from Tutorial 1.
 
-Note this is not an argument for deleting Kafka: Tutorial 1 *ingests from* Kafka. The claim is
-narrower and it is about where you answer questions. A topic is a good bus and a bad index.
+Tutorial 1 never needed a broker, and this is why: everything a topic was doing there, a Fluss
+log table does — and the log table answers questions the topic cannot.
 
 ```bash
 make sql        # second session: paste sql/05-bench-load.sql, leave it running
@@ -406,8 +365,8 @@ row count exists to give you a window wide enough to see it.
 Timings are Flink job durations pulled from the REST API, not wall clock: `docker compose run`
 costs several seconds of container startup that would swamp everything being measured.
 
-Since Tutorial 1 now ingests from Kafka, `verify.sh` gates on the broker like any other core
-service.
+Kafka is a Tutorial-4-only dependency. Nothing else in the stack talks to it, and `verify.sh`
+does not gate on it — the IoT pipeline writes straight into Fluss.
 
 ---
 
@@ -432,7 +391,7 @@ so the contrast window is much narrower than the IoT one.
 
 ## Troubleshooting & reset
 
-**`sql/08` or `sql/01` errors on a re-run.** The Fluss catalog ignores
+**`sql/07` or `sql/01` errors on a re-run.** The Fluss catalog ignores
 `CREATE TABLE IF NOT EXISTS` — it still errors if the table exists. `DROP TABLE` the ones you
 need, or do a full reset.
 
@@ -476,10 +435,9 @@ else.
 | `scripts/start-tiering.sh` | submits the Fluss→Iceberg tiering job |
 | `scripts/demo.sh` | loops a contrast query; `SQL_FILE=` picks which |
 | `scripts/bench.sh` | runs `sql/06`, reads job durations from the Flink REST API |
-| `sql/07-iot-produce.sql` | **Tutorial 1** — sensors → the Kafka topics (swap in your own producer) |
-| `sql/08-iot-pipeline.sql` | **Tutorial 1** — Kafka → Fluss → the two tiered tables |
-| `sql/09-iot-contrast.sql` | **Tutorial 2** — hot vs cold, `-f`-safe (what `make demo` loops) |
-| `sql/10-iot-live.sql` | **Tutorial 2** — live queries, interactive only |
+| `sql/07-iot-pipeline.sql` | **Tutorial 1** — the IoT pipeline, end to end |
+| `sql/08-iot-contrast.sql` | **Tutorial 2** — hot vs cold, `-f`-safe (what `make demo` loops) |
+| `sql/09-iot-live.sql` | **Tutorial 2** — live queries, interactive only |
 | `sql/04-starrocks.sql` | **Tutorial 3** — external Iceberg catalog + the dashboard panels |
 | `sql/05-bench-load.sql` | **Tutorial 4** — bulk load into both Fluss and Kafka |
 | `sql/06-bench-query.sql` | **Tutorial 4** — the same point query, two engines |

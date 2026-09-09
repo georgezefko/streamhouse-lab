@@ -62,22 +62,32 @@ in the StarRocks table the Routine Load maintains, one in bronze, one in whateve
 produces. Each is a separate job that can lag, fail, or drift, and the speed layer and batch
 layer have to be reconciled because they compute the same numbers by different routes.
 
-**The streamhouse version keeps the ingress and deletes the copies:**
+**The streamhouse version deletes the copies, and the broker with them:**
 
 ```
-kafka: iot-telemetry ───┬─▶ Fluss ──(queryable NOW)──┬─▶ Iceberg on MinIO ─▶ StarRocks
-kafka: iot-events    ───┘                            └─ same table, union read
+sensors ──▶ Fluss log table ──(queryable NOW)──┬─▶ Iceberg on MinIO ─▶ StarRocks
+                                               └─ same table, union read
 ```
 
-Kafka stays — Fluss sits behind the broker rather than replacing it, which is why Tutorial 1
-ingests from topics rather than writing into Fluss directly. What goes away is the second and
-third copy. There is no anomalies topic, because the anomaly is a column on a row that is
-queryable the moment it lands. There is no Routine Load, because StarRocks reads the Iceberg
-table that Fluss tiers itself. And there is no speed-layer/batch-layer split to reconcile,
-because `SELECT ... FROM t` and `SELECT ... FROM t$lake` are the same table at two freshnesses,
-not two pipelines computing the same thing twice.
+Start at the top. The topic was doing one job in that diagram: holding an append-only,
+partitioned, replicated stream of readings that something else would later consume. A Fluss
+**log table** is that, plus a schema, plus joins, plus a `SELECT`. So `iot_telemetry` is where
+the readings land, and there is no broker in the analytics path at all.
 
-That is the whole architectural claim. Tutorials 1-3 are its proof.
+Then the copies go. There is no anomalies topic, because the anomaly is a column on a row that
+is queryable the moment it lands. There is no Routine Load, because StarRocks reads the Iceberg
+table Fluss tiers itself. And there is no speed-layer/batch-layer split to reconcile, because
+`SELECT ... FROM t` and `SELECT ... FROM t$lake` are the same table at two freshnesses, not two
+pipelines computing the same numbers by different routes.
+
+That is the whole architectural claim. Tutorials 1-3 are its proof, and Tutorial 4 prices the
+first step of it — what a topic costs you when you try to ask it a question.
+
+**This is not "delete your bus."** A broker is a good fit upstream of all this: many producers,
+many independent consumers, backpressure and replay across team boundaries. The claim is
+narrower — a topic is a poor place to *land analytics data*, because you cannot query it, so
+every question forces another copy. If you do want a broker in front, see
+[Putting a broker upstream](#putting-a-broker-upstream).
 
 ---
 
@@ -147,17 +157,6 @@ DROP TABLE fluss.<name>;
 ```
 
 Or just `make down`, which is the correct full reset.
-
-### JSON timestamps on Kafka need `ISO-8601`
-
-Python's `datetime.isoformat()` emits `2026-09-09T19:21:03.81` — with a `T`. Flink's JSON format
-defaults to `'json.timestamp-format.standard' = 'SQL'`, which expects `2026-09-09 19:21:03.81`
-with a space. On a mismatch it does not raise: the column arrives **NULL** and every other field
-parses fine, so the pipeline looks healthy and the timestamps are silently gone.
-
-`sql/07` sets it on the producer and `sql/08` on the consumer. Keep both if you swap the
-producer. `'json.ignore-parse-errors' = 'true'` on the consumer is the related decision: against
-a real topic one malformed message should not kill the job.
 
 ### StarRocks caches Iceberg metadata
 
@@ -258,8 +257,8 @@ demoing a drained source shows frozen numbers that look like a bug and are not o
 
 | Source | Rate | Rows | Window |
 |---|---|---|---|
-| `sql/07` `gen_telemetry` → `iot-telemetry` | 50/s | 200,000 | ~66 min |
-| `sql/07` `gen_events` → `iot-events` | 5/s | 20,000 | ~66 min |
+| `sql/07` `gen_telemetry` | 50/s | 200,000 | ~66 min |
+| `sql/07` `gen_events` | 5/s | 20,000 | ~66 min |
 | `sql/02` `source_order` (image built-in) | 10/s | 10,000 | ~16 min |
 | `sql/05` `bench_source` | 20,000/s | 20,000,000 | ~17 min |
 
@@ -272,7 +271,7 @@ Correct behaviour, no longer a contrast. Reset and start over.
 threshold_used` rule) and `cnt_anomalies` (how many readings in the window cleared the
 threshold). Only the second one is useful here.
 
-The producer draws temperatures uniformly from 18-30 °C, and a 1-minute window holds ~250
+The generator draws temperatures uniformly from 18-30 °C, and a 1-minute window holds ~250
 readings per device. The maximum of 250 uniform draws clears a 24-29 °C threshold always, so
 `anomaly_flag` is TRUE for nearly every window and ranks nothing — every device ties. The
 *rate*, `cnt_anomalies / cnt_points`, falls cleanly from 50.2% for device_1 (threshold 24.0 °C)
@@ -282,6 +281,44 @@ matches the arithmetic, since temperature is uniform on 18-30 °C and (30-24)/12
 The flag is kept for parity with the reference pipeline, whose generator forced a genuinely hot
 device instead of drawing uniformly — with that input, `max() > threshold` does discriminate.
 It is a good illustration of a demo statistic that looks right and measures nothing.
+
+### Putting a broker upstream
+
+Nothing in Tutorial 1 depends on faker being the source. If you already have devices publishing
+to Kafka, replace the two `gen_*` faker tables in `sql/07` with Kafka sources and leave
+everything downstream alone:
+
+```sql
+CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_telemetry` (
+  `reading_id` BIGINT, `device_id` STRING, `event_time` TIMESTAMP(3),
+  `energy_usage` DOUBLE, `temperature` DOUBLE, `vibration` DOUBLE, `signal_strength` INT
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'iot-telemetry',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'streamhouse-telemetry',
+  'scan.startup.mode' = 'earliest-offset',
+  'format' = 'json',
+  'json.timestamp-format.standard' = 'ISO-8601',
+  'json.ignore-parse-errors' = 'true'
+);
+```
+
+The Kafka connector jar is already mounted (it is there for Tutorial 4), so this needs no new
+dependency. Two things that will bite:
+
+1. **`'json.timestamp-format.standard' = 'ISO-8601'` is not optional.** Python's
+   `datetime.isoformat()` emits `2026-09-09T19:21:03.81` — with a `T`. Flink's JSON format
+   defaults to `SQL`, which expects a space. On a mismatch it does not raise: the column arrives
+   **NULL** while every other field parses fine, so the pipeline looks healthy and the
+   timestamps are silently gone.
+2. **`'json.ignore-parse-errors' = 'true'`**, so one malformed message does not kill the job.
+
+Field names must match the table above; a producer that sends `timestamp` rather than
+`event_time` needs one rename on either side.
+
+This is a fine thing to do — it just is not what the tutorial is arguing, so it is not the
+default. See [What this replaces](#what-this-replaces).
 
 ### Why proctime windows, and what was dropped from kappa
 
@@ -333,7 +370,8 @@ Kafka `9092` · StarRocks `9030` (+ `8030`, `8040`).
 - **Nessie is `IN_MEMORY`** — catalog state dies on `docker compose down`. For branch-lifecycle
   demos that survive restarts, switch to `nessie.version.store.type=ROCKSDB` with a mounted
   volume.
-- **Kafka is core now.** It is the ingress for Tutorial 1 as well as the foil in Tutorial 4, so
-  `verify.sh` gates on the broker alongside every other service.
+- **Kafka is a Tutorial-4-only dependency.** Nothing else in the stack talks to it and
+  `verify.sh` does not gate on it. The IoT pipeline writes straight into Fluss — that is the
+  point, not an omission.
 - **`verify.sh` is a liveness gate only.** It does not assert the Fluss→Iceberg tiering seam,
   which does not exist until `make tiering`.
