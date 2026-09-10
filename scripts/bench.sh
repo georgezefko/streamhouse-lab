@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tutorial 4: how much does one point query cost on Fluss vs Kafka?
+# Experiment 4: how much does one point query cost on Fluss vs Kafka?
 # Requires the stack up and sql/05-bench-load.sql still streaming in a `make sql` session.
 #
 # Timings are Flink job durations from the REST API, not wall clock — `docker compose run`

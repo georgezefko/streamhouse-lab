@@ -7,13 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A Docker Compose lab, not an application: no build, no test suite, no linter. It demonstrates the
 **streamhouse** pattern — Apache Fluss as a sub-second hot tier tiering into Iceberg-on-MinIO
 (cataloged by Nessie), with Flink 1.20 as compute. It backs a blog series, so the deliverable is a
-*reproducible tutorial*, not a feature.
+*reproducible experiment*, not a feature.
 
 The main narrative is a **real-time IoT pipeline** (`sql/07`-`sql/10`): a producer publishes JSON
 to the Kafka topics `iot-telemetry` / `iot-events` → Flink lands them in Fluss → a per-reading
 enriched table + a 1-minute windowed fact table, both tiered to Iceberg, read by StarRocks.
 
-Kafka is the **ingress for the main tutorial**, not a Tutorial-4-only dependency any more.
+Kafka is the **ingress for the main experiment**, not an Experiment-4-only dependency any more.
 `sql/07` is only a stand-in producer: swap in any producer on the same topics with the same
 field names and `sql/08` onward is unchanged. `scripts/iot_producer.py` (`make produce`) is
 exactly that swap, in Python — an alternative to `sql/07`, never run alongside it. It mirrors the author's Mage/lambda pipeline
@@ -23,12 +23,14 @@ Two claims the repo exists to demonstrate:
 1. **vs a lakehouse** — the bare table answers now; the `$lake` path waits for the next flush.
 2. **vs Kafka** — a topic has no index, so a point query means scanning every offset.
 
-**Docs split:** `README.md` is the tutorials (run this, expect that).
+**Docs split:** `README.md` is what this is, how to run it, and the repo layout — nothing
+longer than the quick-start table. `docs/EXPERIMENTS.md` is the experiments (run this, expect that).
 `docs/EXPLANATION.md` is the why — the argument, the hard constraints, the Fluss ⇄ Nessie ⇄
 Iceberg seam, sql-client gotchas, versions. Keep it that way: a "why" paragraph belongs in
-EXPLANATION with a link from the README, not inline.
+EXPLANATION with a link from EXPERIMENTS, not inline.
 
-"Testing" means running the tutorials in the README and checking their stated pass criteria.
+"Testing" means running the experiments in `docs/EXPERIMENTS.md` and checking their stated pass
+criteria.
 
 ## Commands
 
@@ -36,12 +38,12 @@ EXPLANATION with a link from the README, not inline.
 make up          # jars + whole stack + verify gate
 make verify      # liveness gate (containers, endpoints, TM registration, buckets)
 make sql         # interactive Flink SQL client; paste sql/*.sql by hand
-make produce     # Tutorial 1 ingress as a Python producer instead of sql/07 (run one, not both)
+make produce     # Experiment 1 ingress as a Python producer instead of sql/07 (run one, not both)
 make tiering     # submit the Fluss→Iceberg tiering job
-make demo        # Tutorial 2: loops sql/09-iot-contrast.sql
+make demo        # Experiment 2: loops sql/09-iot-contrast.sql
 make demo-orders # same, on the orders appendix (SQL_FILE=/sql/03-contrast.sql)
-make starrocks   # Tutorial 3 overlay
-make bench       # Tutorial 4: Fluss vs Kafka point-lookup cost
+make starrocks   # Experiment 3 overlay
+make bench       # Experiment 4: Fluss vs Kafka point-lookup cost
 make down        # docker compose down -v — the correct full reset
 ```
 

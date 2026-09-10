@@ -5,7 +5,8 @@
 # We use the NATIVE Nessie catalog (org.apache.iceberg.nessie.NessieCatalog), not Iceberg-REST.
 # Fluss bundles only iceberg-core catalogs; NessieCatalog lives in iceberg-nessie, so we add it
 # plus its nessie-client runtime deps. (Nessie's Iceberg-REST endpoint NPEs on createTable with
-# Fluss 0.9.1's Iceberg 1.10 client — see README risk #1 — so the native catalog is the working path.)
+# Fluss 0.9.1's Iceberg 1.10 client — see docs/EXPLANATION.md, "Use the native Nessie
+# catalog" — so the native catalog is the working path.)
 set -euo pipefail
 
 ICEBERG_VERSION="1.10.1"
@@ -64,7 +65,7 @@ download "https://repo1.maven.org/maven2/dev/failsafe/failsafe/3.3.2/failsafe-3.
 download "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-1.20/${ICEBERG_VERSION}/iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar" \
          "iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar"
 
-# Kafka SQL connector: Tutorial 4 only (the Fluss-vs-Kafka point-lookup comparison).
+# Kafka SQL connector: Experiment 4 only (the Fluss-vs-Kafka point-lookup comparison).
 download "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.4.0-1.20/flink-sql-connector-kafka-3.4.0-1.20.jar" \
          "flink-sql-connector-kafka-3.4.0-1.20.jar"
 
