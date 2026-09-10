@@ -1,4 +1,4 @@
--- Tutorial 1, step 1: the sensors. Publish IoT JSON onto Kafka.
+-- Experiment 1, step 1: the sensors. Publish IoT JSON onto Kafka.
 --
 --   this file ──▶ kafka: iot-telemetry ──┐
 --                 kafka: iot-events    ──┴──▶ sql/08-iot-pipeline.sql ──▶ Fluss ──▶ Iceberg
@@ -16,7 +16,7 @@ SET 'execution.runtime-mode' = 'streaming';
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1) The generator. 200k readings at 50/s ≈ 66 minutes — bounded on purpose, but
---    long enough that it does not drain mid-tutorial.
+--    long enough that it does not drain mid-experiment.
 --
 --    Field ranges match the reference Python producer: temperature 18-30 °C,
 --    vibration 0.1-2.0 with occasional spikes, energy 0.5-5.0, signal 70-100.

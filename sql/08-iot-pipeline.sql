@@ -1,4 +1,4 @@
--- Tutorial 1, step 2: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
+-- Experiment 1, step 2: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
 --
 --   kafka: iot-telemetry ─┐
 --                         ├─▶ iot_telemetry (log) ──lookup join dim_device──▶ enriched
@@ -50,7 +50,7 @@ CREATE TABLE iot_telemetry (
   `ptime` AS PROCTIME()
 );
 
--- Tiered as well, so StarRocks can read events from the cold tier in Tutorial 3.
+-- Tiered as well, so StarRocks can read events from the cold tier in Experiment 3.
 -- No PK, for the same union-read reason as the datalake_* tables below.
 -- The type-specific columns are sparse: only the ones belonging to a row's
 -- event_type are populated, exactly as they arrive on the topic.
@@ -109,7 +109,7 @@ CREATE TABLE datalake_device_telemetry (
 );
 
 -- The analytical fact table — the reference pipeline's fact_telemetry_5min, at
--- tutorial time-scale. Dropped vs the original: cnt_events / events_* (needs a
+-- experiment time-scale. Dropped vs the original: cnt_events / events_* (needs a
 -- stream-stream join) and the incomplete_by_* flags (need event time + watermarks).
 -- ponytail: no event counts here; join iot_events at read time instead (sql/04).
 --
@@ -146,7 +146,7 @@ CREATE TABLE datalake_device_health_1min (
 --    Thresholds are spread 24-29 °C across the 11 devices. The producer draws
 --    temperature uniformly from 18-30 °C, so device_1 (24.0) sits over its
 --    threshold about half the time and device_11 (29.0) about a twelfth — which is
---    what makes the Tutorial 3 ranking come out ordered by threshold.
+--    what makes the Experiment 3 ranking come out ordered by threshold.
 -- ─────────────────────────────────────────────────────────────────────────────
 SET 'table.dml-sync' = 'true';
 
@@ -261,7 +261,7 @@ LEFT JOIN fluss_catalog.fluss.dim_device FOR SYSTEM_TIME AS OF t.ptime AS d
 --    out of scope here.
 --    ponytail: proctime window; switch to event-time + WATERMARK when late data matters.
 --
---    1 minute, not the original's 5 — so the fact table produces rows inside a tutorial.
+--    1 minute, not the original's 5 — so the fact table produces rows inside an experiment.
 -- ─────────────────────────────────────────────────────────────────────────────
 EXECUTE STATEMENT SET
 BEGIN

@@ -1,4 +1,4 @@
--- Tutorial 4 setup: one bulk stream, two homes — a Fluss PK table and a Kafka topic.
+-- Experiment 4 setup: one bulk stream, two homes — a Fluss PK table and a Kafka topic.
 -- Run this in `make sql` and LEAVE IT RUNNING, then `make bench` in another shell —
 -- repeatedly, while it is still loading.
 --
@@ -55,7 +55,7 @@ USE CATALOG fluss_catalog;
 
 -- The Fluss side: a PK table, NOT tiered. We want to price a pure hot-tier point lookup; with
 -- datalake.enabled the bare table becomes a union read, which Iceberg cannot do on a PK table
--- (see sql/01). Tutorial 2 already prices the cold tier.
+-- (see sql/01). Experiment 2 already prices the cold tier.
 CREATE TABLE bench_order (
   `order_key`   BIGINT,
   `cust_key`    INT,

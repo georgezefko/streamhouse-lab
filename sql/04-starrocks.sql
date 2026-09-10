@@ -1,4 +1,4 @@
--- Tutorial 3: query the COLD tier from StarRocks.
+-- Experiment 3: query the COLD tier from StarRocks.
 -- Connect:  mysql -h 127.0.0.1 -P 9030 -u root
 -- StarRocks reads the tiered Iceberg tables via Nessie's REST catalog — not Fluss directly.
 --
@@ -26,12 +26,12 @@ SHOW DATABASES FROM iceberg_nessie;
 -- SELECT sum(total_price) FROM datalake_enriched_orders;
 
 -- ═════════════════════════════════════════════════════════════════════════════
--- Tutorial 3 — the IoT cold tier. StarRocks reads Iceberg. Fluss is not in this path.
+-- Experiment 3 — the IoT cold tier. StarRocks reads Iceberg. Fluss is not in this path.
 -- ═════════════════════════════════════════════════════════════════════════════
 SET CATALOG iceberg_nessie;
 USE fluss;
 
--- 0) The point of the tutorial: this is BELOW the union-read count from sql/09 §B1.
+-- 0) The point of the experiment: this is BELOW the union-read count from sql/09 §B1.
 --    StarRocks sees only what the tiering job has flushed.
 SELECT count(*) AS cold_only_readings FROM datalake_device_telemetry;
 

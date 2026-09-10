@@ -6,7 +6,7 @@
 #   minio -> minio-init (creates buckets) -> nessie + fluss servers -> flink
 #
 # NOTE: the Lakehouse Tiering Service is NOT a service here. It is a Flink job you launch
-# with scripts/start-tiering.sh once the stack is healthy (see README, Tutorial 1).
+# with scripts/start-tiering.sh once the stack is healthy (see docs/EXPERIMENTS.md, Experiment 1).
 #
 # Iceberg plugin jars live in ./lib (run `make jars`). The native Nessie catalog + its deps go
 # BOTH on the Fluss servers (they create the Iceberg tables) AND on Flink (the tiering job writes
@@ -42,7 +42,7 @@ x-flink-iceberg-vols: &flink-iceberg-vols
   - ./lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar
   - ./lib/failsafe-3.3.2.jar:/opt/flink/lib/failsafe-3.3.2.jar
   - ./lib/iceberg-flink-runtime-1.20-1.10.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.20-1.10.1.jar
-  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # Tutorials 1 and 4
+  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # Experiments 1 and 4
   - ./sql:/sql   # so `sql-client -f /sql/03-contrast.sql` can run non-interactively
 
 services:
@@ -77,8 +77,8 @@ services:
   # ---------- Nessie: Iceberg catalog over MinIO ----------
   # Fluss uses the NATIVE Nessie catalog API at http://nessie:19120/api/v2 (ref=main), NOT the
   # Iceberg-REST endpoint (/iceberg/main) — REST createTable NPEs with Fluss's Iceberg 1.10 client.
-  # StarRocks (Tutorial 3) still reads via Nessie's REST endpoint; reads are fine, only REST writes NPE.
-  # version.store IN_MEMORY = branch state is LOST on restart. Swap to ROCKSDB (see README) if you
+  # StarRocks (Experiment 3) still reads via Nessie's REST endpoint; reads are fine, only REST writes NPE.
+  # version.store IN_MEMORY = branch state is LOST on restart. Swap to ROCKSDB (see docs/EXPLANATION.md) if you
   # want git-branch lifecycle demos to survive `docker compose down`.
   nessie:
     image: ghcr.io/projectnessie/nessie:0.108.2
@@ -179,7 +179,7 @@ services:
         datalake.iceberg.client.region: us-east-1
     volumes: *fluss-iceberg-vols
 
-  # ---------- Kafka: ingress for Tutorial 1, and the "you cannot query a log" contrast in Tutorial 4 ----------
+  # ---------- Kafka: ingress for Experiment 1, and the "you cannot query a log" contrast in Experiment 4 ----------
   # Single-node KRaft, no ZooKeeper. Nothing else in the stack depends on it; it exists purely
   # to hold the same volume of orders as Fluss so the point-lookup costs are comparable.
   kafka:

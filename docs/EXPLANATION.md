@@ -1,7 +1,7 @@
 # Why the streamhouse — the argument, the constraints, the seam
 
-The [README](../README.md) is the tutorial: run this, expect that. This file is the *why*.
-Nothing here is needed to follow the tutorials; everything here is needed to change them.
+[EXPERIMENTS.md](EXPERIMENTS.md) is the lab work: run this, expect that. This file is the *why*.
+Nothing here is needed to follow the experiments; everything here is needed to change them.
 
 ---
 
@@ -22,7 +22,7 @@ reading the **bare table** unions the two — hot Fluss log ∪ cold Iceberg sna
 
 So the same table, the same SQL, gives two answers, and the difference between them is exactly
 the data a lakehouse-only reader cannot see yet. That is what `make demo` prints, and what
-Tutorial 2 walks through. The gap is not a bug being measured — it is the freshness budget
+Experiment 2 walks through. The gap is not a bug being measured — it is the freshness budget
 made visible.
 
 **The sharper version:** cancel the tiering job in the Flink UI and re-run `make demo`.
@@ -36,7 +36,7 @@ A Kafka topic holds the same records. It has offsets, not indexes. To answer *"w
 retention, and it grows all day.
 
 A Fluss PK table answers the same question with a point lookup. Cost is flat in table size.
-Tutorial 4 measures both against the same volume over the same key space; the numbers are
+Experiment 4 measures both against the same volume over the same key space; the numbers are
 laptop-bound and uninteresting on their own, but the *divergence* as the topic grows is the
 whole argument. Kafka + Iceberg gets you a queryable copy only by making a second copy.
 
@@ -49,7 +49,7 @@ checkpoints only. No lake at all. Every byte lives in the broker until the strea
 an aggregate into the serving database, so raw history is retention-bound and the only queryable
 copy is the one the job decided in advance to compute.
 
-**Lambda (Mage)** — the one this repo's IoT tutorial is shaped after:
+**Lambda (Mage)** — the one this repo's IoT experiment is shaped after:
 
 ```
                         ┌─▶ Mage streaming ─▶ kafka: iot-anomalies ─▶ StarRocks (Routine Load)
@@ -69,7 +69,7 @@ kafka: iot-telemetry ───┬─▶ Fluss ──(queryable NOW)──┬─�
 kafka: iot-events    ───┘                            └─ same table, union read
 ```
 
-Kafka stays — Fluss sits behind the broker rather than replacing it, which is why Tutorial 1
+Kafka stays — Fluss sits behind the broker rather than replacing it, which is why Experiment 1
 ingests from topics rather than writing into Fluss directly. What goes away is the second and
 third copy. There is no anomalies topic, because the anomaly is a column on a row that is
 queryable the moment it lands. There is no Routine Load, because StarRocks reads the Iceberg
@@ -77,7 +77,7 @@ table that Fluss tiers itself. And there is no speed-layer/batch-layer split to 
 because `SELECT ... FROM t` and `SELECT ... FROM t$lake` are the same table at two freshnesses,
 not two pipelines computing the same thing twice.
 
-That is the whole architectural claim. Tutorials 1-3 are its proof.
+That is the whole architectural claim. Experiments 1-3 are its proof.
 
 ---
 
@@ -248,7 +248,7 @@ across repeated SQL sessions.
 
 The faker generates `reading_id` and `order_key` **at random**, not monotonically. `max(id)` is
 not the newest row — it is usually one tiered long ago, so a `max()`-based freshness test
-reports a false negative. `sql/08-iot-contrast.sql` uses an anti-join against `$lake` to find
+reports a false negative. `sql/09-iot-contrast.sql` uses an anti-join against `$lake` to find
 rows that genuinely are not in the lake yet.
 
 ### Why the sources are bounded, and what drains
@@ -300,13 +300,13 @@ Dropped, and what it would take to add back:
 | stream-stream telemetry ⋈ events | hardest part, adds nothing to the freshness argument | join two windowed aggregates on `(device_id, window_start)` |
 | per-event enrichment (`fact_events_enriched`) | never wired up in the original either | — |
 
-The window is 1 minute rather than 5 so the fact table produces rows inside a tutorial.
+The window is 1 minute rather than 5 so the fact table produces rows inside an experiment.
 
 ### Why `bench_order` is not tiered
 
-Tutorial 4 prices a **pure hot-tier point lookup**. With `datalake.enabled` the bare table
+Experiment 4 prices a **pure hot-tier point lookup**. With `datalake.enabled` the bare table
 becomes a union read, which Iceberg cannot do on a PK table at all (see the constraint above).
-Tutorial 2 already prices the cold tier.
+Experiment 2 already prices the cold tier.
 
 ---
 
@@ -319,7 +319,7 @@ Tutorial 2 already prices the cold tier.
 | Object store | MinIO | buckets: `fluss` (hot remote), `warehouse` (cold Iceberg) |
 | Table format | Iceberg `1.10.1` | server-side jars mounted into Fluss |
 | Catalog | Nessie `0.108.2` | native Nessie API @ `:19120/api/v2` — `0.99.0` NPEs on Fluss's Iceberg 1.10 client (optional `lastColumnId`); needs ≥0.108 |
-| Kafka | `apache/kafka:3.9.1` | Tutorial 4 only; single-node KRaft, no ZooKeeper |
+| Kafka | `apache/kafka:3.9.1` | Experiment 4 only; single-node KRaft, no ZooKeeper |
 | OLAP (opt) | StarRocks allin1 | external Iceberg catalog over Nessie's REST endpoint |
 
 Ports: Flink `8083` · MinIO API `9000` / console `9001` (admin/password) · Nessie `19120` ·
@@ -333,7 +333,7 @@ Kafka `9092` · StarRocks `9030` (+ `8030`, `8040`).
 - **Nessie is `IN_MEMORY`** — catalog state dies on `docker compose down`. For branch-lifecycle
   demos that survive restarts, switch to `nessie.version.store.type=ROCKSDB` with a mounted
   volume.
-- **Kafka is core now.** It is the ingress for Tutorial 1 as well as the foil in Tutorial 4, so
+- **Kafka is core now.** It is the ingress for Experiment 1 as well as the foil in Experiment 4, so
   `verify.sh` gates on the broker alongside every other service.
 - **`verify.sh` is a liveness gate only.** It does not assert the Fluss→Iceberg tiering seam,
   which does not exist until `make tiering`.

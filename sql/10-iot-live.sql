@@ -1,4 +1,4 @@
--- Tutorial 2: query the hot tier and the cold tier on the go.
+-- Experiment 2: query the hot tier and the cold tier on the go.
 --
 -- Paste into an INTERACTIVE session (`make sql`). sql-client.sh -f cannot render an
 -- updating view, so the live queries below only work here — not through a script.

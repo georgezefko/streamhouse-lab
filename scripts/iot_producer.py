@@ -39,7 +39,7 @@ def now():
 
 def telemetry(device_id):
     # Temperature 18-30 C against dim_device's 24.0-29.0 thresholds, so the
-    # Tutorial 3 ranking comes out ordered by threshold. Vibration spikes ~5%.
+    # Experiment 3 ranking comes out ordered by threshold. Vibration spikes ~5%.
     return {
         "reading_id": random.randint(1, 100_000_000),
         "device_id": device_id,
