@@ -1,4 +1,4 @@
--- Experiment 1, step 2: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
+-- Experiment 1, part B: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
 --
 --   kafka: iot-telemetry ─┐
 --                         ├─▶ iot_telemetry (log) ──lookup join dim_device──▶ enriched
@@ -6,19 +6,11 @@
 --                                                                               ├─▶ datalake_device_telemetry   (per reading)
 --                                                                               └─▶ datalake_device_health_1min (1-min window)
 --
--- Requires the topics to exist — run sql/07-iot-produce.sql first, or point your own
--- producer at iot-telemetry / iot-events.
+-- Requires the topics to exist — start the producer first: `make produce`
+-- (scripts/iot_producer.py), or point your own producer at iot-telemetry / iot-events with
+-- the same field names and ISO-8601 timestamps.
 --
--- Paste this whole file into an interactive session:  make sql
-
-CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (
-  'type' = 'fluss',
-  'bootstrap.servers' = 'coordinator-server:9123',
-  'iceberg.s3.access-key-id' = 'admin',
-  'iceberg.s3.secret-access-key' = 'password'
-);
-
-USE CATALOG fluss_catalog;
+-- Paste into an interactive session (`make sql`), AFTER sql/common/catalog.sql.
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1) The device dimension. A PK table: this is the lookup-join build side, where
@@ -50,7 +42,7 @@ CREATE TABLE iot_telemetry (
   `ptime` AS PROCTIME()
 );
 
--- Tiered as well, so StarRocks can read events from the cold tier in Experiment 3.
+-- Tiered as well, so StarRocks can read events from the cold tier in part D.
 -- No PK, for the same union-read reason as the datalake_* tables below.
 -- The type-specific columns are sparse: only the ones belonging to a row's
 -- event_type are populated, exactly as they arrive on the topic.
@@ -111,7 +103,7 @@ CREATE TABLE datalake_device_telemetry (
 -- The analytical fact table — the reference pipeline's fact_telemetry_5min, at
 -- experiment time-scale. Dropped vs the original: cnt_events / events_* (needs a
 -- stream-stream join) and the incomplete_by_* flags (need event time + watermarks).
--- ponytail: no event counts here; join iot_events at read time instead (sql/04).
+-- ponytail: no event counts here; join iot_events at read time instead (sql/exp1-starrocks.sql).
 --
 -- cnt_anomalies is what carries the signal. anomaly_flag is the original's
 -- max()>threshold rule, kept for parity, but over a full minute of readings the max
@@ -146,7 +138,7 @@ CREATE TABLE datalake_device_health_1min (
 --    Thresholds are spread 24-29 °C across the 11 devices. The producer draws
 --    temperature uniformly from 18-30 °C, so device_1 (24.0) sits over its
 --    threshold about half the time and device_11 (29.0) about a twelfth — which is
---    what makes the Experiment 3 ranking come out ordered by threshold.
+--    what makes the part-D ranking come out ordered by threshold.
 -- ─────────────────────────────────────────────────────────────────────────────
 SET 'table.dml-sync' = 'true';
 
@@ -172,7 +164,7 @@ SET 'table.dml-sync' = 'false';
 --
 --    'earliest-offset' so re-running this picks up everything already produced.
 --    'json.timestamp-format.standard' = 'ISO-8601' must match the producer — see the
---    note in sql/07. 'json.ignore-parse-errors' keeps one malformed message from
+--    note in scripts/iot_producer.py. 'json.ignore-parse-errors' keeps one malformed message from
 --    killing the job, which is what you want against a real topic.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_telemetry` (
@@ -219,7 +211,8 @@ CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_events` (
 );
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 6) Land the topics in Fluss. Two detached jobs.
+-- 6) Land the topics in Fluss. ONE detached job with two sinks — an EXECUTE STATEMENT SET
+--    compiles into a single JobGraph, which is why the Flink UI shows both sink names on one row.
 --    From here on the data is indexed and queryable — which it was not on the topic.
 -- ─────────────────────────────────────────────────────────────────────────────
 EXECUTE STATEMENT SET
@@ -253,7 +246,8 @@ LEFT JOIN fluss_catalog.fluss.dim_device FOR SYSTEM_TIME AS OF t.ptime AS d
   ON t.device_id = d.device_id;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 8) Derive both tiered tables. Two more detached jobs.
+-- 8) Derive both tiered tables. One more detached job, again two sinks off one enriched stream:
+--    the per-reading table and the windowed aggregate read the same view, not each other.
 --
 --    The window is PROCESSING time. A proctime tumble needs no watermark and emits
 --    append-only, which is exactly what a log-table sink can consume. The reference
@@ -305,4 +299,4 @@ BEGIN
 END;
 
 -- Next:  make tiering     (start moving hot -> cold)
--- Then:  sql/10-iot-live.sql in this session, or `make demo` in another shell.
+-- Then:  sql/exp1-live.sql in this session, or `make demo` in another shell.

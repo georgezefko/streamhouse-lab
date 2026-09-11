@@ -1,9 +1,9 @@
-# Experiment 3 overlay — StarRocks to query the COLD (tiered Iceberg) data.
+# Experiment 1, part D — StarRocks to query the COLD (tiered Iceberg) data.
 # Usage:  docker compose -f docker-compose.yml -f docker-compose.starrocks.yml up -d starrocks
 #
 # StarRocks reads the Iceberg tables Fluss tiered to MinIO, cataloged by Nessie — it does NOT
 # read Fluss directly. This is the "query stale/cold data with a real OLAP engine" piece.
-# After it's up, register the external catalog with sql/04-starrocks.sql (see docs/EXPERIMENTS.md, Experiment 3).
+# After it's up, register the external catalog with sql/exp1-starrocks.sql (see docs/EXPERIMENTS.md, Experiment 1 part D).
 
 services:
   starrocks:

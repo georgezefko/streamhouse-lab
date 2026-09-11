@@ -1,17 +1,8 @@
--- Experiment 2: query the hot tier and the cold tier on the go.
+-- Experiment 1, part C: query the hot tier and the cold tier on the go.
 --
--- Paste into an INTERACTIVE session (`make sql`). sql-client.sh -f cannot render an
--- updating view, so the live queries below only work here — not through a script.
+-- Paste into an INTERACTIVE session (`make sql`), after sql/common/catalog.sql. sql-client.sh -f
+-- cannot render an updating view, so the live queries below only work here — not through a script.
 -- Ctrl-C / 'q' leaves a result view and returns you to the prompt.
-
-CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (
-  'type' = 'fluss',
-  'bootstrap.servers' = 'coordinator-server:9123',
-  'iceberg.s3.access-key-id' = 'admin',
-  'iceberg.s3.secret-access-key' = 'password'
-);
-
-USE CATALOG fluss_catalog;
 
 -- ═════════════════════════════════════════════════════════════════════════════
 -- A) LIVE — the hot tier, updating in place.
@@ -41,6 +32,9 @@ FROM datalake_device_health_1min;
 
 -- ═════════════════════════════════════════════════════════════════════════════
 -- B) THE THREE READ PATHS — same table, batch mode, side by side.
+--
+-- Running these in a SECOND `make sql` window? Catalogs are per-session: paste
+-- sql/common/catalog.sql there first, or every name here is "Object not found".
 -- ═════════════════════════════════════════════════════════════════════════════
 SET 'execution.runtime-mode' = 'batch';
 SET 'sql-client.execution.result-mode' = 'tableau';

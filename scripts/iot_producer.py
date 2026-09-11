@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """A stand-in device fleet: publishes JSON to the iot-telemetry / iot-events topics.
 
-Same contract as sql/07-iot-produce.sql — same topics, same field names, same
-distributions — so sql/08 onward cannot tell which one is running. Use one or the
-other, never both, or you get twice the data.
+This is THE ingress for the pipeline — sql/exp1-pipeline.sql reads the topics it writes.
+Swap in any producer on the same topics with the same field names and nothing downstream
+changes.
 
-  docker compose --profile producer up -d iot-producer     (or: make produce)
+  make produce      Experiment 1: iot-telemetry + iot-events, 50 readings/s, 200k rows
+  make bench-load   Experiment 2: bench-telemetry only, 20k/s, 20M rows over 2M keys
 
-Ported from the Mage/lambda project's confluent-kafka generator, with the rates
-raised to sql/07's so the timings in docs/EXPLANATION.md still hold.
+Ported from the Mage/lambda project's confluent-kafka generator.
 """
 import json
 import os
@@ -18,11 +18,14 @@ import time
 from datetime import datetime, timezone
 
 BROKERS    = os.environ.get("KAFKA_BROKERS", "kafka:9092")
-RATE       = float(os.environ.get("RATE", "50"))        # telemetry rows/s, as sql/07
+TOPIC      = os.environ.get("TOPIC", "iot-telemetry")   # bench-telemetry for Experiment 2
+RATE       = float(os.environ.get("RATE", "50"))        # telemetry rows/s
 ROWS       = int(os.environ.get("ROWS", "200000"))      # 0 = run forever
-EVENT_ODDS = float(os.environ.get("EVENT_ODDS", "0.1")) # -> ~5 events/s at RATE=50
+EVENT_ODDS = float(os.environ.get("EVENT_ODDS", "0.1")) # -> ~5 events/s at RATE=50; 0 = none
+ID_MAX     = int(os.environ.get("ID_MAX", "100000000")) # reading_id key space. Experiment 2
+                                                        # narrows it so a given id exists.
 
-# 11 devices, matching dim_device. sql/08's lookup join NULLs anything else.
+# 11 devices, matching dim_device. The lookup join in sql/exp1-pipeline.sql NULLs anything else.
 DEVICES = [f"device_{i}" for i in range(1, 12)]
 
 
@@ -31,7 +34,7 @@ def now():
 
     Flink reads these as TIMESTAMP(3) with 'json.timestamp-format.standard' =
     'ISO-8601'. No UTC offset: a "+00:00" suffix only parses into TIMESTAMP_LTZ,
-    and sql/08 has 'json.ignore-parse-errors' = 'true', so a mismatch here NULLs
+    and the consumer sets 'json.ignore-parse-errors' = 'true', so a mismatch here NULLs
     the column silently instead of failing.
     """
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds")
@@ -39,9 +42,9 @@ def now():
 
 def telemetry(device_id):
     # Temperature 18-30 C against dim_device's 24.0-29.0 thresholds, so the
-    # Experiment 3 ranking comes out ordered by threshold. Vibration spikes ~5%.
+    # part-D ranking comes out ordered by threshold. Vibration spikes ~5%.
     return {
-        "reading_id": random.randint(1, 100_000_000),
+        "reading_id": random.randint(1, ID_MAX),
         "device_id": device_id,
         "event_time": now(),
         "energy_usage": round(random.uniform(0.0, 5.0), 2),
@@ -79,11 +82,12 @@ def event(device_id):
 
 
 def selftest():
-    """The shapes sql/08 reads. Runs without a broker: python iot_producer.py --selftest"""
+    """The shapes sql/exp1-pipeline.sql reads. No broker needed: iot_producer.py --selftest"""
     t = telemetry("device_1")
     assert set(t) == {"reading_id", "device_id", "event_time", "energy_usage",
                       "temperature", "vibration", "signal_strength"}, t
     assert 18.0 <= t["temperature"] <= 30.0
+    assert 1 <= t["reading_id"] <= ID_MAX
     assert "+" not in t["event_time"] and "T" in t["event_time"], t["event_time"]
     datetime.fromisoformat(t["event_time"])
 
@@ -105,6 +109,19 @@ def selftest():
     print("ok")
 
 
+def produce(p, topic, key, payload):
+    """produce(), waiting out a full local queue instead of dying on BufferError.
+
+    librdkafka buffers 100k messages by default; at the Experiment 2 rate a slow broker
+    can fill that, and an unhandled BufferError ends the run mid-benchmark.
+    """
+    while True:
+        try:
+            return p.produce(topic, key=key, value=json.dumps(payload))
+        except BufferError:
+            p.poll(0.1)
+
+
 def main():
     from confluent_kafka import Producer
 
@@ -113,13 +130,16 @@ def main():
     sent = 0
     # Pace against a wall-clock deadline rather than sleeping per message: at 50/s
     # a per-message sleep drifts badly on the OS timer granularity.
+    # ponytail: single-threaded json.dumps tops out somewhere around 20-50k msg/s, so the
+    # Experiment 2 rate is a ceiling, not a promise. Falling short only means the topic grows
+    # more slowly — the benchmark still diverges. Shard across processes if you need more.
     started = time.monotonic()
-    print(f"producing to {BROKERS} at {RATE}/s, {ROWS or 'unbounded'} readings", flush=True)
+    print(f"producing to {BROKERS}/{TOPIC} at {RATE}/s, {ROWS or 'unbounded'} readings", flush=True)
     while ROWS == 0 or sent < ROWS:
         d = random.choice(DEVICES)
-        p.produce("iot-telemetry", key=d, value=json.dumps(telemetry(d)))
+        produce(p, TOPIC, d, telemetry(d))
         if random.random() < EVENT_ODDS:
-            p.produce("iot-events", key=d, value=json.dumps(event(d)))
+            produce(p, "iot-events", d, event(d))
         sent += 1
         p.poll(0)
         behind = started + sent / RATE - time.monotonic()

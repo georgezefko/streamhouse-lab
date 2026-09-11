@@ -1,4 +1,7 @@
-.PHONY: jars up verify down ps logs sql tiering demo demo-orders bench starrocks sr-sql clean
+# StarRocks lives in the overlay, so every command touching it needs both files.
+SR_COMPOSE = docker compose -f docker-compose.yml -f docker-compose.starrocks.yml
+
+.PHONY: jars up verify down ps logs sql produce tiering demo starrocks sr-sql bench-load bench wap wap-break clean
 
 # Setup — fetch Fluss server-side Iceberg jars (run once)
 jars:
@@ -20,8 +23,10 @@ verify:
 
 # Full reset. Includes the StarRocks overlay on purpose: StarRocks caches Iceberg metadata,
 # so a survivor of `down -v` serves manifest paths whose files no longer exist in MinIO.
+# The producer profiles must be named too — compose ignores containers whose profile is
+# inactive, so without these the producers keep running against a torn-down broker.
 down:
-	docker compose -f docker-compose.yml -f docker-compose.starrocks.yml down -v
+	$(SR_COMPOSE) --profile producer --profile bench down -v
 
 ps:
 	docker compose ps
@@ -29,44 +34,61 @@ ps:
 logs:
 	docker compose logs -f coordinator-server tablet-server
 
-# Open the Flink SQL client. Experiment 1: paste sql/07-iot-produce.sql, then sql/08 in a
-# second session.
+# Open the Flink SQL client. Paste sql/common/catalog.sql first, then the experiment's file.
 # Throwaway container per invocation, so concurrent sessions are fine.
 sql:
 	docker compose run --rm sql-client
 
-# Experiment 1 — a Python producer as the ingress instead of sql/07-iot-produce.sql.
-# Run this OR sql/07, never both: same topics, so both together means double the data.
+# Experiment 1, part A — the device fleet. This is the ingress; there is no other.
 # `RATE=200 ROWS=0 make produce` to override.
 produce:
 	docker compose --profile producer up -d iot-producer
 	@echo "producing to iot-telemetry / iot-events — docker compose logs -f iot-producer"
 
-# Experiment 1 — start the Fluss -> Iceberg tiering job (after the tables exist)
+# Experiment 1, part B — start the Fluss -> Iceberg tiering job (after the tables exist)
 tiering:
 	bash scripts/start-tiering.sh
 
-# Experiment 2 — hot vs cold, side by side. Needs the tiering job already running.
+# Experiment 1, part C — hot vs cold, side by side. Needs the tiering job already running.
 # `make demo N=12` for more iterations.
 demo:
 	bash scripts/demo.sh $(N)
 
-# The same contrast on the orders appendix (sql/01-03).
-demo-orders:
-	SQL_FILE=/sql/03-contrast.sql bash scripts/demo.sh $(N)
-
-# Experiment 3 — StarRocks over the cold tier
+# Experiment 1, part D — StarRocks over the cold tier
 starrocks:
-	docker compose -f docker-compose.yml -f docker-compose.starrocks.yml up -d starrocks
+	$(SR_COMPOSE) up -d starrocks
 	@echo "StarRocks (MySQL protocol)  mysql -h 127.0.0.1 -P 9030 -u root"
 
-# Needs a mysql client ON THE HOST (a bare macOS shell may not have one).
-# Without it:  docker compose exec starrocks mysql -h 127.0.0.1 -P 9030 -u root
+# Uses the host's mysql client if there is one (nicer paste behaviour), otherwise the one
+# inside the StarRocks container. A bare macOS shell has no mysql; that is not a problem.
 sr-sql:
-	mysql -h 127.0.0.1 -P 9030 -u root
+	@if command -v mysql >/dev/null 2>&1; then \
+	  mysql -h 127.0.0.1 -P 9030 -u root; \
+	else \
+	  echo "no host mysql client — using the one in the container"; \
+	  $(SR_COMPOSE) exec starrocks mysql -h 127.0.0.1 -P 9030 -u root; \
+	fi
 
-# Experiment 4 — point-lookup cost: Fluss vs Kafka. Nothing here is tiered.
-# Needs sql/05-bench-load.sql still loading in a `make sql` session.
+# Experiment 3 — write-audit-publish on a Nessie branch. Needs the Exp 1 pipeline + tiering
+# running (it publishes from datalake_device_health_1min).
+wap:
+	python3 scripts/wap.py
+
+# The same cycle with one corrupt row injected: the audit fails, main is never touched.
+wap-break:
+	python3 scripts/wap.py --break
+
+# Experiment 2, step 1 — bulk-load the same readings into a Kafka topic and a Fluss PK table.
+# Starts the producer and submits a detached Flink job, then returns. Give it ~100 s before
+# benching, and bench WHILE it is still loading.
+bench-load:
+	docker compose --profile bench up -d bench-producer
+	docker compose run --rm -T sql-client sh -c \
+	  "cat /sql/common/catalog.sql /sql/exp2-bench-load.sql > /tmp/run.sql && /opt/flink/bin/sql-client.sh -f /tmp/run.sql"
+	@echo "loading bench-telemetry — docker compose logs -f bench-producer"
+
+# Experiment 2, step 2 — point-lookup cost: Fluss vs Kafka. Nothing here is tiered.
+# Run it two or three times a minute apart while `make bench-load` is still loading.
 bench:
 	bash scripts/bench.sh
 

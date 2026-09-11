@@ -31,12 +31,12 @@ copy while the hot tier keeps serving. Restart it and the cold number catches up
 
 ### 2. vs Kafka — a topic has no index
 
-A Kafka topic holds the same records. It has offsets, not indexes. To answer *"what is order
+A Kafka topic holds the same records. It has offsets, not indexes. To answer *"what is reading
 424242?"* Flink must deserialize every record from earliest to latest offset. Cost is linear in
 retention, and it grows all day.
 
 A Fluss PK table answers the same question with a point lookup. Cost is flat in table size.
-Experiment 4 measures both against the same volume over the same key space; the numbers are
+Experiment 2 measures both against the same volume over the same key space; the numbers are
 laptop-bound and uninteresting on their own, but the *divergence* as the topic grows is the
 whole argument. Kafka + Iceberg gets you a queryable copy only by making a second copy.
 
@@ -81,6 +81,34 @@ That is the whole architectural claim. Experiments 1-3 are its proof.
 
 ---
 
+### 3. The cold tier is versioned — gate the publish, not the ingest
+
+A quality gate has to live somewhere. Put it in the ingest path and a bad batch stops the
+stream; put it after the fact and consumers have already read the bad rows.
+
+Nessie makes a third option cheap. A branch is a few bytes of metadata, not a copy of the data,
+so a job can write a curated table on `audit`, assert on it there, and merge into `main` only on
+a pass. Readers of `main` see the publish atomically or not at all; a failure leaves an unmerged
+branch to inspect and an alert, while ingest and tiering carry on untouched.
+
+This is the alternative to medallion staging. Bronze/silver/gold physically copies the same rows
+three times and *still* needs a mechanism to keep a bad gold table from being read. Here the
+"layer" is a ref and the gate is a merge. Experiment 3 runs it both ways.
+
+Two things make it work against a live stream, both verified:
+- **Merges are per table.** The tiering job commits to `main` continuously; the branch only
+  touches `curated.*`. The merge applies with `main` well past the branch point — no conflict,
+  because no shared content key.
+- **The streaming writer is never branched.** The tiering service takes a single
+  `--datalake.iceberg.ref`, and Fluss tracks one lake snapshot per table, so there is exactly one
+  writer to `main` and nothing to reconcile. Branches are for *derived* tables and for readers.
+
+What does not work, for the same reasons: dual-writing the raw stream to two branches and
+merging them later. Two heads that both moved `fluss.datalake_device_telemetry` conflict, and
+Nessie has no row-level union to resolve it with.
+
+---
+
 ## Hard constraints
 
 These are non-obvious, cost real debugging time, and are load-bearing for the demo.
@@ -98,8 +126,8 @@ java.lang.UnsupportedOperationException: lake records must instance of sorted vi
 ```
 
 Log tables concatenate rather than merge, so they union-read fine. This is why every tiered
-table in this repo — `datalake_device_telemetry`, `datalake_device_health_1min`, `iot_events`,
-`datalake_enriched_orders` — has **no primary key**.
+table in this repo — `datalake_device_telemetry`, `datalake_device_health_1min`, `iot_events` —
+has **no primary key**.
 
 Paimon's reader does implement the interface. Iceberg union read on PK tables is a post-0.9
 roadmap item.
@@ -112,10 +140,10 @@ Reading a PK table in streaming mode emits `-U/+U`, and an append-only sink reje
 Table sink ... doesn't support consuming update and delete changes
 ```
 
-So making the tiered table append-only forces its source to be append-only too. `iot_telemetry`
-and `fluss_order` are log tables for this reason. Only `dim_device`, `fluss_customer` and
-`fluss_nation` stay PK: they are lookup-join build sides, where the point lookups actually
-happen and where nothing streams *out*.
+So making the tiered table append-only forces its source to be append-only too — `iot_telemetry`
+is a log table for this reason. Only `dim_device` stays PK in the pipeline: it is the
+lookup-join build side, where the point lookups actually happen and where nothing streams *out*.
+(`bench_telemetry` in Experiment 2 is PK too, and nothing reads it in streaming mode.)
 
 This is also why the fact table uses a **processing-time** tumbling window. A proctime tumble
 needs no watermark and emits append-only rows; an unbounded `GROUP BY` would emit a changelog
@@ -155,8 +183,8 @@ defaults to `'json.timestamp-format.standard' = 'SQL'`, which expects `2026-09-0
 with a space. On a mismatch it does not raise: the column arrives **NULL** and every other field
 parses fine, so the pipeline looks healthy and the timestamps are silently gone.
 
-`sql/07` sets it on the producer and `sql/08` on the consumer. Keep both if you swap the
-producer. `'json.ignore-parse-errors' = 'true'` on the consumer is the related decision: against
+`scripts/iot_producer.py` writes ISO-8601 and `sql/exp1-pipeline.sql` reads it that way. Keep
+both ends aligned if you swap the producer. `'json.ignore-parse-errors' = 'true'` on the consumer is the related decision: against
 a real topic one malformed message should not kill the job.
 
 ### StarRocks caches Iceberg metadata
@@ -190,6 +218,48 @@ The Fluss connector is built for it. Do not bump to 2.x.
 ---
 
 ## How the Fluss ⇄ Nessie ⇄ Iceberg seam actually works (validated)
+
+### When the Iceberg table actually appears in Nessie
+
+Two separate moments, and confusing them is what makes tiering look broken:
+
+1. **`CREATE TABLE ... WITH ('table.datalake.enabled' = 'true')`** — the Fluss
+   **coordinator-server** immediately creates a matching *empty* Iceberg table `fluss.<name>` in
+   Nessie, on branch `main`, warehouse `s3://warehouse/`. It does this itself, with the
+   `datalake.iceberg.*` settings in `docker-compose.yml` and the `NessieCatalog` jars mounted at
+   `/opt/fluss/plugins/iceberg/`. No Flink job is involved; MinIO gets the table's first
+   `metadata.json` and **no data files**.
+2. **`make tiering`** — the Fluss Lakehouse Tiering Service (a long-running Flink job, not a
+   compose service) reads the Fluss log of every datalake-enabled table and, every
+   `table.datalake.freshness` (30s here), writes Parquet under `s3://warehouse/fluss/<name>/`
+   and commits **one Iceberg snapshot per flush** through Nessie.
+
+So the catalog entry exists from DDL time and the *data* arrives only once tiering runs. That is
+why a table can be queryable in Fluss, visible in Nessie, and still empty in `$lake`:
+
+```sql
+SELECT count(*) FROM datalake_device_telemetry;            -- hot ∪ cold, answers now
+SELECT count(*) FROM datalake_device_telemetry$lake;       -- Iceberg only, as of the last commit
+SELECT * FROM datalake_device_telemetry$lake$snapshots;    -- one row per flush
+```
+
+Check the catalog side directly, without Flink:
+
+```bash
+curl -s localhost:19120/api/v2/trees/main/entries | jq '.entries[].name.elements'
+# fluss, fluss.datalake_device_telemetry, fluss.datalake_device_health_1min, fluss.iot_events
+
+docker compose run --rm --entrypoint sh minio-init -c \
+  'mc alias set m http://minio:9000 admin password >/dev/null && mc ls -r m/warehouse'
+# before tiering: only <table>/metadata/00000-*.metadata.json — no data/ prefix
+```
+
+Two consequences worth remembering: the catalog and the MinIO files are separate lifetimes — the
+Nessie volume can be dropped while Parquet survives, or the reverse, hence `make down` rather
+than a partial reset; and `DROP TABLE` in Fluss removes the Fluss side only, leaving the Nessie
+entry behind. See the two constraints above.
+
+### The four fixes
 
 Getting tiering working end-to-end took four non-obvious fixes. All are in the code now; this is
 the map if you touch them.
@@ -225,9 +295,11 @@ across repeated SQL sessions.
   `"$@"`, so `-f` is silently ignored. Call `/opt/flink/bin/sql-client.sh` directly.
 - It **exits 0 even when a statement fails.** `demo.sh` and `bench.sh` grep output for
   `[ERROR]` instead of trusting the exit code.
-- `-f` skips the image's init script, so the pre-baked faker sources (`source_order`,
-  `source_customer`, `source_nation`) do not exist in a scripted session. Scripted SQL must
-  define its own sources — `sql/05-bench-load.sql` and `sql/07-iot-pipeline.sql` both do.
+- **There is no INCLUDE.** The shared catalog DDL lives in `sql/common/catalog.sql` and is
+  either pasted first (interactive) or concatenated onto the file being run (`demo.sh`,
+  `bench.sh`, `make bench-load` all do `cat /sql/common/catalog.sql <file> > /tmp/run.sql`).
+- `-f` also skips the image's init script, so its pre-baked demo sources do not exist in a
+  scripted session. Scripted SQL must define every source it uses.
 - **Qualify every `CREATE TEMPORARY TABLE` / `CREATE TEMPORARY VIEW`.** An unqualified `CREATE`
   lands in whatever catalog is current, which breaks after a `USE CATALOG fluss_catalog`.
 - The bare table is unreadable in batch until the first lake snapshot exists
@@ -235,10 +307,9 @@ across repeated SQL sessions.
   in that window; the union read errors.
 - Live queries need the *interactive* client: `SET 'execution.runtime-mode' = 'streaming'` plus
   `result-mode = 'table'`. `-f` cannot render an updating view — which is why
-  `sql/09-iot-live.sql` is paste-only.
+  `sql/exp1-live.sql` is paste-only.
 - To run ad-hoc SQL non-interactively, write a file into `./sql/` (mounted at `/sql`), run it,
-  delete it. Do not pipe SQL through nested shell quoting — it mangles the doubled single quotes
-  that flink-faker expressions need.
+  delete it. Do not pipe SQL through nested shell quoting — it mangles quoted SQL literals.
 
 ---
 
@@ -246,25 +317,28 @@ across repeated SQL sessions.
 
 ### Why the anti-join, not `max()`
 
-The faker generates `reading_id` and `order_key` **at random**, not monotonically. `max(id)` is
-not the newest row — it is usually one tiered long ago, so a `max()`-based freshness test
-reports a false negative. `sql/09-iot-contrast.sql` uses an anti-join against `$lake` to find
-rows that genuinely are not in the lake yet.
+The producer draws `reading_id` **at random**, not monotonically. `max(reading_id)` is not the
+newest row — it is usually one tiered long ago, so a `max()`-based freshness test reports a
+false negative. `sql/exp1-contrast.sql` uses an anti-join against `$lake` to find rows that
+genuinely are not in the lake yet.
 
-### Why the sources are bounded, and what drains
+### Why the producers are bounded, and what drains
 
 Every contrast in this repo only exists **while data is still arriving**. Benchmarking or
-demoing a drained source shows frozen numbers that look like a bug and are not one.
+demoing after the producer stops shows frozen numbers that look like a bug and are not one.
 
-| Source | Rate | Rows | Window |
-|---|---|---|---|
-| `sql/07` `gen_telemetry` → `iot-telemetry` | 50/s | 200,000 | ~66 min |
-| `sql/07` `gen_events` → `iot-events` | 5/s | 20,000 | ~66 min |
-| `sql/02` `source_order` (image built-in) | 10/s | 10,000 | ~16 min |
-| `sql/05` `bench_source` | 20,000/s | 20,000,000 | ~17 min |
+| Producer | Topic | Rate | Rows | Window |
+|---|---|---|---|---|
+| `make produce` (`iot-producer`) | `iot-telemetry` | 50/s | 200,000 | ~66 min |
+| ″ | `iot-events` | ~5/s | ~20,000 | ~66 min |
+| `make bench-load` (`bench-producer`) | `bench-telemetry` | 20,000/s | 20,000,000 | ~17 min |
 
-If `rows_only_in_hot` hits 0 and stays there, the source drained: tiering caught up completely.
-Correct behaviour, no longer a contrast. Reset and start over.
+`ROWS` bounds it and `ROWS=0` runs forever; `RATE` and `ID_MAX` are the other knobs
+(`BENCH_RATE` / `BENCH_ROWS` for the bench service). Bounded by default so a forgotten container
+cannot fill the disk.
+
+If `rows_only_in_hot` hits 0 and stays there, the producer finished: tiering caught up
+completely. Correct behaviour, no longer a contrast. Restart the producer or reset.
 
 ### Why the fact table counts anomalies instead of flagging them
 
@@ -294,19 +368,19 @@ Dropped, and what it would take to add back:
 
 | Kappa feature | Why dropped | To add |
 |---|---|---|
-| event-time window + watermark | needs a synthetic clock the faker cannot drive | `WATERMARK FOR event_time` on `iot_telemetry`, then `DESCRIPTOR(event_time)` |
-| `incomplete_by_coverage` / `_by_volume` | only meaningful with the outage simulation | a real producer instead of faker |
+| event-time window + watermark | needs a synthetic clock the producer does not simulate | `WATERMARK FOR event_time` on `iot_telemetry`, then `DESCRIPTOR(event_time)` |
+| `incomplete_by_coverage` / `_by_volume` | only meaningful with the outage simulation | teach `iot_producer.py` to stall and backfill |
 | `cnt_events` / `events_*` per window | needs the stream-stream join | see the row below |
 | stream-stream telemetry ⋈ events | hardest part, adds nothing to the freshness argument | join two windowed aggregates on `(device_id, window_start)` |
 | per-event enrichment (`fact_events_enriched`) | never wired up in the original either | — |
 
 The window is 1 minute rather than 5 so the fact table produces rows inside an experiment.
 
-### Why `bench_order` is not tiered
+### Why `bench_telemetry` is not tiered
 
-Experiment 4 prices a **pure hot-tier point lookup**. With `datalake.enabled` the bare table
+Experiment 2 prices a **pure hot-tier point lookup**. With `datalake.enabled` the bare table
 becomes a union read, which Iceberg cannot do on a PK table at all (see the constraint above).
-Experiment 2 already prices the cold tier.
+Experiment 1 already prices the cold tier.
 
 ---
 
@@ -319,7 +393,7 @@ Experiment 2 already prices the cold tier.
 | Object store | MinIO | buckets: `fluss` (hot remote), `warehouse` (cold Iceberg) |
 | Table format | Iceberg `1.10.1` | server-side jars mounted into Fluss |
 | Catalog | Nessie `0.108.2` | native Nessie API @ `:19120/api/v2` — `0.99.0` NPEs on Fluss's Iceberg 1.10 client (optional `lastColumnId`); needs ≥0.108 |
-| Kafka | `apache/kafka:3.9.1` | Experiment 4 only; single-node KRaft, no ZooKeeper |
+| Kafka | `apache/kafka:3.9.1` | the ingress (Exp 1) and the contrast (Exp 2); single-node KRaft, no ZooKeeper |
 | OLAP (opt) | StarRocks allin1 | external Iceberg catalog over Nessie's REST endpoint |
 
 Ports: Flink `8083` · MinIO API `9000` / console `9001` (admin/password) · Nessie `19120` ·
@@ -330,10 +404,11 @@ Kafka `9092` · StarRocks `9030` (+ `8030`, `8040`).
 - **Tiering jar filename is version-specific.** `start-tiering.sh` assumes
   `fluss-flink-tiering-0.9.1-incubating.jar`. If missing:
   `docker compose exec jobmanager ls /opt/flink/opt | grep tiering`.
-- **Nessie is `IN_MEMORY`** — catalog state dies on `docker compose down`. For branch-lifecycle
-  demos that survive restarts, switch to `nessie.version.store.type=ROCKSDB` with a mounted
-  volume.
-- **Kafka is core now.** It is the ingress for Experiment 1 as well as the foil in Experiment 4, so
+- **Nessie runs on `ROCKSDB`** with a named volume, so the catalog — tables, branches, commits —
+  survives a container restart (Experiment 3 needs that). `make down` still drops the volume:
+  that is the intended full reset. The container runs as `user: "0:0"` because a named volume
+  mounts root-owned and the image's uid 10000 cannot create RocksDB's directory inside it.
+- **Kafka is core now.** It is the ingress for Experiment 1 as well as the foil in Experiment 2, so
   `verify.sh` gates on the broker alongside every other service.
 - **`verify.sh` is a liveness gate only.** It does not assert the Fluss→Iceberg tiering seam,
   which does not exist until `make tiering`.

@@ -1,14 +1,8 @@
--- THE CONTRAST: a streamhouse answers from the hot tier now; a lakehouse waits for the flush.
--- Run non-interactively (see scripts/demo.sh) — a fresh -f session has no catalog, so create it.
-
-CREATE CATALOG IF NOT EXISTS fluss_catalog WITH (
-  'type' = 'fluss',
-  'bootstrap.servers' = 'coordinator-server:9123',
-  'iceberg.s3.access-key-id' = 'admin',
-  'iceberg.s3.secret-access-key' = 'password'
-);
-
-USE CATALOG fluss_catalog;
+-- Experiment 1, part C: THE CONTRAST — a streamhouse answers from the hot tier now; a lakehouse waits
+-- for the next flush.
+--
+-- Run by `make demo` (scripts/demo.sh), which prepends sql/common/catalog.sql. Pasting it into
+-- an interactive session works too, same order.
 
 SET 'sql-client.execution.result-mode' = 'tableau';
 SET 'execution.runtime-mode' = 'batch';
@@ -25,7 +19,7 @@ SELECT (SELECT count(*) FROM datalake_device_health_1min)      AS windows_hot_pl
        (SELECT count(*) FROM datalake_device_health_1min$lake) AS windows_cold_only;
 
 -- 3) Name specific readings the lakehouse path cannot see.
---    NOT max(reading_id) — faker generates reading_id at random, so the largest key is not
+--    NOT max(reading_id) — the producer draws reading_id at random, so the largest key is not
 --    the newest row. An anti-join against $lake is the honest test.
 SELECT t.reading_id AS reading_only_in_hot, t.device_id, t.temperature, t.anomaly_flag
 FROM datalake_device_telemetry t

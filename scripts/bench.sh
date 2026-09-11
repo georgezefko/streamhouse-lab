@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Experiment 4: how much does one point query cost on Fluss vs Kafka?
-# Requires the stack up and sql/05-bench-load.sql still streaming in a `make sql` session.
+# Experiment 2: how much does one point query cost on Fluss vs Kafka?
+# Requires the stack up and `make bench-load` still loading (producer + Flink job).
 #
 # Timings are Flink job durations from the REST API, not wall clock — `docker compose run`
 # costs several seconds of container startup that would swamp the numbers we care about.
@@ -15,13 +15,13 @@ print(len(json.load(urllib.request.urlopen(sys.argv[1]))["jobs"]))' "$FLINK/jobs
 
 before=$(count_jobs)
 
-out=$(docker compose run --rm -T sql-client \
-        /opt/flink/bin/sql-client.sh -f /sql/06-bench-query.sql 2>&1)
+out=$(docker compose run --rm -T sql-client sh -c \
+        "cat /sql/common/catalog.sql /sql/exp2-bench-query.sql > /tmp/run.sql && /opt/flink/bin/sql-client.sh -f /tmp/run.sql" 2>&1)
 echo "$out"
 
 # sql-client exits 0 even when a statement fails, so grep for it (same check demo.sh uses).
 if grep -q '\[ERROR\]' <<<"$out"; then
-  echo "✗ SQL failed — is sql/05-bench-load.sql running in a 'make sql' session?" >&2
+  echo "✗ SQL failed — did you run 'make bench-load' first?" >&2
   exit 1
 fi
 
