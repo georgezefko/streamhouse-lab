@@ -1,7 +1,7 @@
 -- The Fluss catalog. Every Flink SQL session in this repo needs it first.
 --
---   interactive (`make sql`):  paste this file, then the experiment's file.
---   scripted:                  demo.sh / bench.sh concatenate it onto the file they run —
+--   interactive (`make sql`):  paste this file, then the step's file.
+--   scripted:                  demo.sh concatenates it onto the file it runs —
 --                              the SQL client has no INCLUDE, so this is the whole mechanism.
 --
 -- The lake (Iceberg/Nessie) config is inherited from the Fluss servers; the s3 creds here are

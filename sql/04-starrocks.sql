@@ -1,4 +1,4 @@
--- Experiment 1, part D: query the COLD tier from StarRocks — it is plain Iceberg.
+-- Step 5: query the COLD tier from StarRocks — it is plain Iceberg.
 -- Connect:  mysql -h 127.0.0.1 -P 9030 -u root
 -- StarRocks reads the tiered Iceberg tables via Nessie's REST catalog — not Fluss directly.
 --
@@ -28,11 +28,11 @@ SHOW DATABASES FROM iceberg_nessie;   -- the tiered tables live in `fluss`
 SET CATALOG iceberg_nessie;
 USE fluss;
 
--- 0) The point of this part: this is BELOW the union-read count from sql/exp1-live.sql §B1.
+-- 0) The point of this part: this is BELOW the union-read count from sql/02-live.sql §B1.
 --    StarRocks sees only what the tiering job has flushed.
 SELECT count(*) AS cold_only_readings FROM datalake_device_telemetry;
 
--- 1) Temperature vs each device's own threshold (kappa panel 1).
+-- 1) Temperature vs each device's own threshold.
 SELECT device_id,
        location_id,
        model,
@@ -59,7 +59,7 @@ GROUP BY root_cause, component
 ORDER BY failures DESC
 LIMIT 10;
 
--- 3) Devices ranked by how much time they spend over their own threshold (kappa panel 3).
+-- 3) Devices ranked by how much time they spend over their own threshold.
 --    Rate, not anomaly_flag: over a full minute the max reading almost always clears the
 --    threshold, so the flag is TRUE for nearly every window and ranks nothing. The rate
 --    tracks each device's threshold — device_1 (24.0 C) should top this, device_11 (29.0) sit last.

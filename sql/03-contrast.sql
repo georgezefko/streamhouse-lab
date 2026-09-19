@@ -1,7 +1,7 @@
--- Experiment 1, part C: THE CONTRAST — a streamhouse answers from the hot tier now; a lakehouse waits
+-- Step 4, scripted: THE CONTRAST — a streamhouse answers from the hot tier now; a lakehouse waits
 -- for the next flush.
 --
--- Run by `make demo` (scripts/demo.sh), which prepends sql/common/catalog.sql. Pasting it into
+-- Run by `make demo` (scripts/demo.sh), which prepends sql/catalog.sql. Pasting it into
 -- an interactive session works too, same order.
 
 SET 'sql-client.execution.result-mode' = 'tableau';

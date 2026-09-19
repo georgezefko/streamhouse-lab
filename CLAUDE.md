@@ -6,73 +6,61 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Docker Compose lab, not an application: no build, no test suite, no linter. It demonstrates the
 **streamhouse** pattern — Apache Fluss as a sub-second hot tier tiering into Iceberg-on-MinIO
-(cataloged by Nessie), with Flink 1.20 as compute. It backs a blog series, so the deliverable is a
-*reproducible experiment*, not a feature.
+(cataloged by Nessie), with Flink 1.20 as compute. It backs a blog post, so the deliverable is a
+*reproducible tutorial*, not a feature.
 
 Everything here is **Python or SQL**: `scripts/iot_producer.py` produces, Flink SQL processes.
 There is no other producer — flink-faker was removed deliberately.
 
 The narrative is a **real-time IoT pipeline**: `make produce` publishes JSON to the Kafka topics
-`iot-telemetry` / `iot-events` → Flink (`sql/exp1-pipeline.sql`) lands them in Fluss → a
+`iot-telemetry` / `iot-events` → Flink (`sql/01-pipeline.sql`) lands them in Fluss → a
 per-reading enriched table + a 1-minute windowed fact table, both tiered to Iceberg, read by
-StarRocks. It mirrors the author's Mage/lambda pipeline (Kafka → Mage → a second Kafka topic →
-StarRocks Routine Load), with the second copy removed.
+StarRocks.
 
-Kafka is the **ingress**, not an Experiment-4-only dependency. The topics, the field names and
-the JSON encoding are the whole contract: swap in any producer on the same topics and
-`sql/exp1-pipeline.sql` onward is unchanged.
+Kafka is the **ingress**. The topics, the field names and the JSON encoding are the whole
+contract: swap in any producer on the same topics and `sql/01-pipeline.sql` onward is unchanged.
 
-`sql/` is organised per experiment (`exp1-*` the pipeline and its reads, `exp2-*` the
-Kafka-vs-Fluss benchmark), plus `sql/common/catalog.sql` — the
-`fluss_catalog` DDL every Flink SQL session needs. The SQL client has **no INCLUDE**: paste it
-first interactively, and the scripts concatenate it
-(`cat /sql/common/catalog.sql <file> > /tmp/run.sql`).
+**One tutorial, six steps**, and `sql/` is numbered to match: 0 `make up` · 1 `make produce` ·
+2 `sql/01-pipeline.sql` · 3 `make tiering` · 4 `sql/02-live.sql` + `make demo`
+(`sql/03-contrast.sql`) · 5 `make starrocks` + `sql/04-starrocks.sql`. Plus `sql/catalog.sql` —
+the `fluss_catalog` DDL every Flink SQL session needs. The SQL client has **no INCLUDE**: paste
+it first interactively, and `demo.sh` concatenates it
+(`cat /sql/catalog.sql <file> > /tmp/run.sql`).
 
-Two claims, and **one experiment per claim** — keep it that way:
-1. **Experiment 1, vs a lakehouse** — the bare table answers now; the `$lake` path waits for the
-   next flush. Parts: A produce, B pipeline, C query hot vs cold, D StarRocks over the cold tier
-   (part D is a *part*, not a third experiment — it proves the cold copy is plain Iceberg).
-2. **Experiment 2, vs Kafka** — a topic has no index, so a point query means scanning every
-   offset.
-3. **Experiment 3, vs medallion staging** — the cold tier is versioned: write a curated table on
-   a Nessie branch, audit it there, merge to `main` only on a pass. `make wap` / `make wap-break`.
-   The cycle is **lake-only**: Flink is the compute, the curated table is Iceberg with no Fluss
-   counterpart (never tiered, Fluss does not know it exists), the merge is one Nessie HTTP call,
-   and StarRocks reads whichever ref you point a catalog at. Nothing in the loop writes Fluss or
-   Kafka, which is why a failed audit cannot stall ingest.
+The claim the tutorial makes, and the only one — keep it that way: **vs a lakehouse**, the bare
+table answers now while the `$lake` path waits for the next flush; and the cold copy is plain
+Iceberg, which step 5 proves by reading it from StarRocks with Fluss nowhere in the path.
+Two earlier experiments (a Kafka-vs-Fluss point-lookup benchmark, and write-audit-publish on a
+Nessie branch) were removed on `feat/tutorial1`. Do not reintroduce them here.
 
-**Docs split:** `README.md` is what this is, how to run it, and the repo layout — nothing
-longer than the quick-start table. `docs/EXPERIMENTS.md` is the experiments (run this, expect that).
-`docs/EXPLANATION.md` is the why — the argument, the hard constraints, the Fluss ⇄ Nessie ⇄
-Iceberg seam, sql-client gotchas, versions. Keep it that way: a "why" paragraph belongs in
-EXPLANATION with a link from EXPERIMENTS, not inline.
+**Docs split:** `README.md` is what this is, how to run it, and the repo layout — nothing longer
+than the quick-start table. `docs/TUTORIAL.md` is everything else: the six steps (run this,
+expect that), then "Why it is built this way" — hard constraints, the Fluss ⇄ Nessie ⇄ Iceberg
+seam, sql-client gotchas, design notes, troubleshooting, versions. There is no EXPLANATION.md
+any more; a "why" paragraph belongs in TUTORIAL's second half with an in-page link from the
+step, not inline in the step.
 
-"Testing" means running the experiments in `docs/EXPERIMENTS.md` and checking their stated pass
-criteria.
+"Testing" means running the steps in `docs/TUTORIAL.md` and checking their stated pass criteria.
 
 ## Commands
 
 ```bash
 make up          # jars + whole stack + verify gate
 make verify      # liveness gate (containers, endpoints, TM registration, buckets)
-make sql         # interactive Flink SQL client; paste sql/common/catalog.sql, then a file
-make produce     # Experiment 1 ingress: scripts/iot_producer.py -> Kafka
-make tiering     # submit the Fluss→Iceberg tiering job
-make demo        # Exp 1 part C: loops sql/exp1-contrast.sql
-make starrocks   # Exp 1 part D: StarRocks overlay
-make bench-load  # Exp 2: bulk producer + the Flink load job
-make bench       # Exp 2: Fluss vs Kafka point-lookup cost
-make wap         # Exp 3: write-audit-publish on a Nessie branch
-make wap-break   # Exp 3: the same cycle with a corrupt row — audit fails, main untouched
+make sql         # interactive Flink SQL client; paste sql/catalog.sql, then a file
+make produce     # step 1: scripts/iot_producer.py -> Kafka
+make tiering     # step 3: submit the Fluss→Iceberg tiering job
+make demo        # step 4: loops sql/03-contrast.sql
+make starrocks   # step 5: StarRocks overlay
 make down        # docker compose down -v — the correct full reset
 ```
 
-Running SQL non-interactively (what `demo.sh`, `bench.sh` and `make bench-load` do — the catalog
-DDL is concatenated on because the client has no INCLUDE):
+Running SQL non-interactively (what `demo.sh` does — the catalog DDL is concatenated on because
+the client has no INCLUDE):
 
 ```bash
 docker compose run --rm -T sql-client sh -c \
-  "cat /sql/common/catalog.sql /sql/<file>.sql > /tmp/run.sql && /opt/flink/bin/sql-client.sh -f /tmp/run.sql"
+  "cat /sql/catalog.sql /sql/<file>.sql > /tmp/run.sql && /opt/flink/bin/sql-client.sh -f /tmp/run.sql"
 ```
 
 `./sql` is mounted at `/sql`. To run ad-hoc SQL, write a file into `./sql/`, run it, delete it —
@@ -88,7 +76,7 @@ with the Fluss log. On a PK table that is a *sort-merge*, so
 `org.apache.fluss.lake.source.SortedRecordReader`. `fluss-lake-iceberg-0.9.1-incubating` does not
 implement it anywhere — verified by unpacking the jar. The read fails with
 `lake records must instance of sorted view`. This is why every tiered table here —
-`datalake_device_telemetry`, `datalake_device_health_1min`, `iot_events` — has
+`iot_telemetry`, `iot_events`, `datalake_device_telemetry`, `datalake_device_health_1min` — has
 **no primary key**. Paimon implements it; Iceberg union read on PK tables is post-0.9.
 
 **A log-table sink cannot consume a PK table's changelog.** Reading a PK table in streaming mode
@@ -96,16 +84,11 @@ emits `-U/+U`, and an append-only sink rejects it
 (`doesn't support consuming update and delete changes`). So making the tiered table append-only
 forces its source to be append-only too — hence `iot_telemetry` is also a log table. Only
 `dim_device` stays PK: it is the lookup-join build side, where the point lookups actually happen
-and nothing streams out. (`bench_telemetry` in Experiment 2 is PK and untiered.)
+and nothing streams out.
 
 Same reason the IoT fact table uses a **processing-time** tumbling window: a proctime tumble
 needs no watermark and emits append-only. An unbounded `GROUP BY` would emit a changelog and the
 sink would reject it.
-
-**Nessie branches are for derived tables and readers, never for the streaming writer.** The
-tiering service takes one `--datalake.iceberg.ref` and Fluss tracks one lake snapshot per table,
-so there is a single writer to `main`. Merges are per content key, which is why Experiment 3's
-`curated.*` branch merges cleanly while tiering keeps committing `fluss.*` to `main`.
 
 **Nessie is ROCKSDB on a named volume** (`user: "0:0"` — a named volume mounts root-owned and the
 image's uid 10000 cannot mkdir in it). Branches survive restarts; `make down` still wipes them.
@@ -119,14 +102,14 @@ Nessie entry is normal, not a failure.
 **Dropping a tiered table leaves an orphan in Nessie.** `DROP TABLE` removes the Fluss table but
 not the Iceberg one, so the recreate fails with `Table fluss.<name> already exists` even though
 `SHOW TABLES` does not list it. Drop it through an Iceberg catalog (the jars are already on the
-Flink classpath — recipe is in `docs/EXPLANATION.md`), or `make down`.
+Flink classpath — recipe is in `docs/TUTORIAL.md`), or `make down`.
 
 **The Fluss catalog ignores `CREATE TABLE IF NOT EXISTS`** — it still errors if the table exists.
 
 **JSON timestamps on Kafka need `'json.timestamp-format.standard' = 'ISO-8601'`.** Python's
 `datetime.isoformat()` emits `2025-09-09T20:15:30.123` with a `T`; Flink's JSON format defaults
 to `SQL`, which expects a space, and silently yields NULL. Set it on both producer and consumer
-(the producer and `sql/exp1-pipeline.sql` both do).
+(the producer and `sql/01-pipeline.sql` both do).
 
 **Use the native Nessie catalog, not Iceberg-REST.** `NessieCatalog` against `/api/v2`. Nessie's
 Iceberg-REST `createTable` NPEs with Fluss 0.9.1's Iceberg 1.10 client. StarRocks still reads via
@@ -154,12 +137,11 @@ the REST endpoint — reads are fine, only REST writes NPE.
 The producer draws `reading_id` **at random**, not monotonically. `max(reading_id)` is not the
 newest row — it is usually one tiered long ago, so a `max()`-based freshness test reports a false
 negative. Use an anti-join against `$lake` to find rows that genuinely are not in the lake
-(`sql/exp1-contrast.sql` does this).
+(`sql/03-contrast.sql` does this).
 
-Both producers are **bounded** by `ROWS`: `make produce` is 200k readings at 50/s (~66 min) plus
-~20k events; `make bench-load` is 20M at 20k/s (~17 min). Every contrast in this repo only exists
-while data is still arriving. Benchmarking or demoing after the producer finishes shows frozen
-numbers that look like a bug and are not one.
+The producer is **bounded** by `ROWS`: `make produce` is 200k readings at 50/s (~66 min) plus
+~20k events. Every contrast in this repo only exists while data is still arriving. Demoing after
+the producer finishes shows frozen numbers that look like a bug and are not one.
 
 ## Diagrams
 

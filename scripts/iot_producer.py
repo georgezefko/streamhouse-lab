@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """A stand-in device fleet: publishes JSON to the iot-telemetry / iot-events topics.
 
-This is THE ingress for the pipeline — sql/exp1-pipeline.sql reads the topics it writes.
+This is THE ingress for the pipeline — sql/01-pipeline.sql reads the topics it writes.
 Swap in any producer on the same topics with the same field names and nothing downstream
 changes.
 
-  make produce      Experiment 1: iot-telemetry + iot-events, 50 readings/s, 200k rows
-  make bench-load   Experiment 2: bench-telemetry only, 20k/s, 20M rows over 2M keys
+  make produce      iot-telemetry + iot-events, 50 readings/s, 200k rows
 
 Ported from the Mage/lambda project's confluent-kafka generator.
 """
@@ -18,14 +17,13 @@ import time
 from datetime import datetime, timezone
 
 BROKERS    = os.environ.get("KAFKA_BROKERS", "kafka:9092")
-TOPIC      = os.environ.get("TOPIC", "iot-telemetry")   # bench-telemetry for Experiment 2
+TOPIC      = os.environ.get("TOPIC", "iot-telemetry")
 RATE       = float(os.environ.get("RATE", "50"))        # telemetry rows/s
 ROWS       = int(os.environ.get("ROWS", "200000"))      # 0 = run forever
 EVENT_ODDS = float(os.environ.get("EVENT_ODDS", "0.1")) # -> ~5 events/s at RATE=50; 0 = none
-ID_MAX     = int(os.environ.get("ID_MAX", "100000000")) # reading_id key space. Experiment 2
-                                                        # narrows it so a given id exists.
+ID_MAX     = int(os.environ.get("ID_MAX", "100000000")) # reading_id key space
 
-# 11 devices, matching dim_device. The lookup join in sql/exp1-pipeline.sql NULLs anything else.
+# 11 devices, matching dim_device. The lookup join in sql/01-pipeline.sql NULLs anything else.
 DEVICES = [f"device_{i}" for i in range(1, 12)]
 
 
@@ -82,7 +80,7 @@ def event(device_id):
 
 
 def selftest():
-    """The shapes sql/exp1-pipeline.sql reads. No broker needed: iot_producer.py --selftest"""
+    """The shapes sql/01-pipeline.sql reads. No broker needed: iot_producer.py --selftest"""
     t = telemetry("device_1")
     assert set(t) == {"reading_id", "device_id", "event_time", "energy_usage",
                       "temperature", "vibration", "signal_strength"}, t
@@ -112,8 +110,8 @@ def selftest():
 def produce(p, topic, key, payload):
     """produce(), waiting out a full local queue instead of dying on BufferError.
 
-    librdkafka buffers 100k messages by default; at the Experiment 2 rate a slow broker
-    can fill that, and an unhandled BufferError ends the run mid-benchmark.
+    librdkafka buffers 100k messages by default; a slow broker can fill that, and an
+    unhandled BufferError ends the run mid-stream.
     """
     while True:
         try:
@@ -130,9 +128,9 @@ def main():
     sent = 0
     # Pace against a wall-clock deadline rather than sleeping per message: at 50/s
     # a per-message sleep drifts badly on the OS timer granularity.
-    # ponytail: single-threaded json.dumps tops out somewhere around 20-50k msg/s, so the
-    # Experiment 2 rate is a ceiling, not a promise. Falling short only means the topic grows
-    # more slowly — the benchmark still diverges. Shard across processes if you need more.
+    # ponytail: single-threaded json.dumps tops out somewhere around 20-50k msg/s. Falling
+    # short of RATE only means the topic grows more slowly. Shard across processes if you
+    # need more.
     started = time.monotonic()
     print(f"producing to {BROKERS}/{TOPIC} at {RATE}/s, {ROWS or 'unbounded'} readings", flush=True)
     while ROWS == 0 or sent < ROWS:

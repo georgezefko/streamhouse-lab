@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Watch the cold tier chase the hot tier. Requires the stack up (`make up`), the producer
-# (`make produce`) and sql/exp1-pipeline.sql running, and the tiering job (`make tiering`).
+# (`make produce`) and sql/01-pipeline.sql running, and the tiering job (`make tiering`).
 #
 # SQL_FILE overrides which contrast to loop.
 #
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ITERATIONS="${1:-6}"
-SQL_FILE="${SQL_FILE:-/sql/exp1-contrast.sql}"
+SQL_FILE="${SQL_FILE:-/sql/03-contrast.sql}"
 
 for ((i = 1; i <= ITERATIONS; i++)); do
   printf '\n═══ %s  (%d/%d) ═══\n' "$(date +%H:%M:%S)" "$i" "$ITERATIONS"
@@ -20,7 +20,7 @@ for ((i = 1; i <= ITERATIONS; i++)); do
   #    so -f there is silently ignored. Call sql-client.sh directly.
   #  - the SQL client has no INCLUDE, so the shared catalog DDL is concatenated on here.
   out=$(docker compose run --rm -T sql-client sh -c \
-          "cat /sql/common/catalog.sql $SQL_FILE > /tmp/run.sql && /opt/flink/bin/sql-client.sh -f /tmp/run.sql" 2>&1)
+          "cat /sql/catalog.sql $SQL_FILE > /tmp/run.sql && /opt/flink/bin/sql-client.sh -f /tmp/run.sql" 2>&1)
   echo "$out"
 
   # sql-client exits 0 even when a statement fails, so grep for it. This is the runnable check.

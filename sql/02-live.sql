@@ -1,6 +1,6 @@
--- Experiment 1, part C: query the hot tier and the cold tier on the go.
+-- Step 4: query the hot tier and the cold tier on the go.
 --
--- Paste into an INTERACTIVE session (`make sql`), after sql/common/catalog.sql. sql-client.sh -f
+-- Paste into an INTERACTIVE session (`make sql`), after sql/catalog.sql. sql-client.sh -f
 -- cannot render an updating view, so the live queries below only work here — not through a script.
 -- Ctrl-C / 'q' leaves a result view and returns you to the prompt.
 
@@ -42,7 +42,7 @@ GROUP BY device_id;
 --
 --      A windowing TVF needs a time attribute, and datalake_device_telemetry has plain
 --      TIMESTAMP columns — so mirror it with a proctime column added. Qualify the CREATE:
---      unqualified it lands in whatever catalog is current (see docs/EXPLANATION.md).
+--      unqualified it lands in whatever catalog is current (see docs/TUTORIAL.md).
 --
 --      Proctime, so no watermark is needed. Output is append-only: one batch of rows every
 --      10 seconds rather than numbers moving in place. Newest batch is at the bottom.
@@ -69,7 +69,7 @@ FROM datalake_device_health_1min;
 -- B) THE THREE READ PATHS — same table, batch mode, side by side.
 --
 -- Running these in a SECOND `make sql` window? Catalogs are per-session: paste
--- sql/common/catalog.sql there first, or every name here is "Object not found".
+-- sql/catalog.sql there first, or every name here is "Object not found".
 -- ═════════════════════════════════════════════════════════════════════════════
 SET 'execution.runtime-mode' = 'batch';
 SET 'sql-client.execution.result-mode' = 'tableau';

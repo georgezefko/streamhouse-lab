@@ -1,4 +1,4 @@
--- Experiment 1, part B: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
+-- Step 2: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
 --
 --   kafka: iot-telemetry ─┐
 --                         ├─▶ iot_telemetry (log, tiered) ─lookup join dim_device─▶ enriched
@@ -10,7 +10,7 @@
 -- (scripts/iot_producer.py), or point your own producer at iot-telemetry / iot-events with
 -- the same field names and ISO-8601 timestamps.
 --
--- Paste into an interactive session (`make sql`), AFTER sql/common/catalog.sql.
+-- Paste into an interactive session (`make sql`), AFTER sql/catalog.sql.
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1) The device dimension. A PK table: this is the lookup-join build side, where
@@ -20,7 +20,7 @@
 --    a PK table keeps the current row per key in a compacted KV store, and
 --    'table.kv.ttl' has no default (row-level TTL off), so these 11 rows persist.
 --    Only the changelog behind them is governed by 'table.log.ttl'. Tiering it would
---    break union read anyway — see the sort-merge note in docs/EXPLANATION.md.
+--    break union read anyway — see the sort-merge note in docs/TUTORIAL.md.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE dim_device (
   `device_id`      STRING NOT NULL,
@@ -35,7 +35,7 @@ CREATE TABLE dim_device (
 -- 2) The hot landing tables — BRONZE. Both LOG tables (no PK).
 --    Reading a PK table in streaming mode emits -U/+U, and an append-only sink
 --    rejects that. Everything downstream here is append-only, so these must be too.
---    See docs/EXPLANATION.md.
+--    See docs/TUTORIAL.md.
 --
 --    Both are TIERED. Without 'table.datalake.enabled' a table has no Iceberg
 --    counterpart at all — no entry in Nessie, no Parquet in MinIO, no `$lake` to
@@ -61,7 +61,7 @@ CREATE TABLE iot_telemetry (
   'table.datalake.freshness' = '30s'
 );
 
--- Tiered for the same reason, so StarRocks reads events from the cold tier in part D.
+-- Tiered for the same reason, so StarRocks reads events from the cold tier in step 5.
 -- No PK, for the same union-read reason as the datalake_* tables below.
 -- The type-specific columns are sparse: only the ones belonging to a row's
 -- event_type are populated, exactly as they arrive on the topic.
@@ -96,10 +96,9 @@ CREATE TABLE iot_events (
 -- Per-reading, enriched with the device's own threshold. Rows appear immediately,
 -- which is what makes the hot-vs-cold contrast visible within seconds.
 --
--- In the reference lambda pipeline this is the point where anomalies were published
--- back onto a THIRD Kafka topic and Routine-Loaded into StarRocks — a second copy,
--- kept in sync by hand. Here the row is queryable the instant it lands and tiers
--- itself into Iceberg. That is the whole argument; see docs/EXPLANATION.md.
+-- This is the grain a lambda pipeline would have had to publish onto a THIRD Kafka topic
+-- and load into an OLAP store to make readable — a second copy, kept in sync by hand. Here
+-- the row is queryable the instant it lands and tiers itself into Iceberg.
 CREATE TABLE datalake_device_telemetry (
   `reading_id`      BIGINT,
   `device_id`       STRING NOT NULL,
@@ -120,9 +119,9 @@ CREATE TABLE datalake_device_telemetry (
 );
 
 -- The analytical fact table — the reference pipeline's fact_telemetry_5min, at
--- experiment time-scale. Dropped vs the original: cnt_events / events_* (needs a
+-- tutorial time-scale. Dropped vs the original: cnt_events / events_* (needs a
 -- stream-stream join) and the incomplete_by_* flags (need event time + watermarks).
--- ponytail: no event counts here; join iot_events at read time instead (sql/exp1-starrocks.sql).
+-- ponytail: no event counts here; join iot_events at read time instead (sql/04-starrocks.sql).
 --
 -- cnt_anomalies is what carries the signal. anomaly_flag is the original's
 -- max()>threshold rule, kept for parity, but over a full minute of readings the max
@@ -274,7 +273,7 @@ LEFT JOIN fluss_catalog.fluss.dim_device FOR SYSTEM_TIME AS OF t.ptime AS d
 --    out of scope here.
 --    ponytail: proctime window; switch to event-time + WATERMARK when late data matters.
 --
---    1 minute, not the original's 5 — so the fact table produces rows inside an experiment.
+--    1 minute, not the original's 5 — so the fact table produces rows while you watch.
 -- ─────────────────────────────────────────────────────────────────────────────
 EXECUTE STATEMENT SET
 BEGIN
@@ -317,5 +316,5 @@ BEGIN
   GROUP BY device_id, window_start, window_end;
 END;
 
--- Next:  make tiering     (start moving hot -> cold)
--- Then:  sql/exp1-live.sql in this session, or `make demo` in another shell.
+-- Next:  make tiering     (step 3 — start moving hot -> cold)
+-- Then:  sql/02-live.sql in this session, or `make demo` in another shell.

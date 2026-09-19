@@ -6,7 +6,7 @@
 #   minio -> minio-init (creates buckets) -> nessie + fluss servers -> flink
 #
 # NOTE: the Lakehouse Tiering Service is NOT a service here. It is a Flink job you launch
-# with scripts/start-tiering.sh once the stack is healthy (see docs/EXPERIMENTS.md, Experiment 1).
+# with scripts/start-tiering.sh once the stack is healthy (see docs/TUTORIAL.md).
 #
 # Iceberg plugin jars live in ./lib (run `make jars`). The native Nessie catalog + its deps go
 # BOTH on the Fluss servers (they create the Iceberg tables) AND on Flink (the tiering job writes
@@ -42,8 +42,8 @@ x-flink-iceberg-vols: &flink-iceberg-vols
   - ./lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar
   - ./lib/failsafe-3.3.2.jar:/opt/flink/lib/failsafe-3.3.2.jar
   - ./lib/iceberg-flink-runtime-1.20-1.10.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.20-1.10.1.jar
-  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # Experiments 1 and 4
-  - ./sql:/sql   # so `sql-client.sh -f /sql/exp1-contrast.sql` can run non-interactively
+  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # the Kafka ingress
+  - ./sql:/sql   # so `sql-client.sh -f /sql/03-contrast.sql` can run non-interactively
 
 services:
 
@@ -77,9 +77,9 @@ services:
   # ---------- Nessie: Iceberg catalog over MinIO ----------
   # Fluss uses the NATIVE Nessie catalog API at http://nessie:19120/api/v2 (ref=main), NOT the
   # Iceberg-REST endpoint (/iceberg/main) — REST createTable NPEs with Fluss's Iceberg 1.10 client.
-  # StarRocks (Exp 1 part D) still reads via Nessie's REST endpoint; reads are fine, only REST writes NPE.
+  # StarRocks (step 5) still reads via Nessie's REST endpoint; reads are fine, only REST writes NPE.
   # version.store ROCKSDB on a named volume: the catalog — every table, every branch, every
-  # commit — survives a container restart. Experiment 3 (write-audit-publish on a branch) needs
+  # commit — survives a container restart. Branch history needs
   # that; `make down` still wipes it with the volume, which is the intended full reset.
   nessie:
     image: ghcr.io/projectnessie/nessie:0.108.2
@@ -186,9 +186,9 @@ services:
         datalake.iceberg.client.region: us-east-1
     volumes: *fluss-iceberg-vols
 
-  # ---------- Kafka: ingress for Experiment 1, and the "you cannot query a log" contrast in Experiment 2 ----------
-  # Single-node KRaft, no ZooKeeper. Experiment 1 ingests from it; Experiment 2 additionally
-  # holds the same volume of readings here as in Fluss, so the point-lookup costs are comparable.
+  # ---------- Kafka: the ingress ----------
+  # Single-node KRaft, no ZooKeeper. The producer writes iot-telemetry / iot-events here and
+  # sql/01-pipeline.sql reads them; Fluss sits behind the broker, it does not replace it.
   kafka:
     image: apache/kafka:3.9.1
     ports:
@@ -206,7 +206,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
-  # The device fleet — THE ingress for Experiment 1.  `make produce`
+  # The device fleet — THE ingress.  `make produce`
   # No Dockerfile on purpose: this stays a compose lab with nothing to build.
   iot-producer:
     image: python:3.12-slim
@@ -217,24 +217,6 @@ services:
       KAFKA_BROKERS: kafka:9092
       RATE: ${RATE:-50}          # telemetry rows/s
       ROWS: ${ROWS:-200000}      # 0 = run forever
-    volumes:
-      - ./scripts:/scripts:ro
-    command: sh -c "pip install -q confluent-kafka && python -u /scripts/iot_producer.py"
-
-  # The same script in bulk mode — Experiment 2's load.  `make bench-load`
-  # One topic, no events, and a 2M key space so `reading_id = 424242` exists and repeats.
-  bench-producer:
-    image: python:3.12-slim
-    profiles: ["bench"]
-    depends_on:
-      - kafka
-    environment:
-      KAFKA_BROKERS: kafka:9092
-      TOPIC: bench-telemetry
-      RATE: ${BENCH_RATE:-20000}
-      ROWS: ${BENCH_ROWS:-20000000}
-      ID_MAX: 2000000
-      EVENT_ODDS: "0"
     volumes:
       - ./scripts:/scripts:ro
     command: sh -c "pip install -q confluent-kafka && python -u /scripts/iot_producer.py"
