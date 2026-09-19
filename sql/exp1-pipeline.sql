@@ -1,8 +1,8 @@
 -- Experiment 1, part B: the pipeline. Kafka -> Fluss (hot) -> Iceberg on MinIO (cold).
 --
 --   kafka: iot-telemetry ─┐
---                         ├─▶ iot_telemetry (log) ──lookup join dim_device──▶ enriched
---   kafka: iot-events   ──┴─▶ iot_events (log, tiered)                          │
+--                         ├─▶ iot_telemetry (log, tiered) ─lookup join dim_device─▶ enriched
+--   kafka: iot-events   ──┴─▶ iot_events     (log, tiered)                      │
 --                                                                               ├─▶ datalake_device_telemetry   (per reading)
 --                                                                               └─▶ datalake_device_health_1min (1-min window)
 --
@@ -14,7 +14,13 @@
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1) The device dimension. A PK table: this is the lookup-join build side, where
---    the point lookups actually happen. Not tiered — it is 11 rows and it is hot.
+--    the point lookups actually happen.
+--
+--    The ONE table here that is deliberately not tiered, and it loses nothing by it:
+--    a PK table keeps the current row per key in a compacted KV store, and
+--    'table.kv.ttl' has no default (row-level TTL off), so these 11 rows persist.
+--    Only the changelog behind them is governed by 'table.log.ttl'. Tiering it would
+--    break union read anyway — see the sort-merge note in docs/EXPLANATION.md.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE dim_device (
   `device_id`      STRING NOT NULL,
@@ -26,10 +32,20 @@ CREATE TABLE dim_device (
 );
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2) The hot landing tables. Both LOG tables (no PK).
+-- 2) The hot landing tables — BRONZE. Both LOG tables (no PK).
 --    Reading a PK table in streaming mode emits -U/+U, and an append-only sink
 --    rejects that. Everything downstream here is append-only, so these must be too.
 --    See docs/EXPLANATION.md.
+--
+--    Both are TIERED. Without 'table.datalake.enabled' a table has no Iceberg
+--    counterpart at all — no entry in Nessie, no Parquet in MinIO, no `$lake` to
+--    query, and nothing outside Fluss can read it at any age. On top of that the
+--    log segments age out at 'table.log.ttl' (7 days by default), so the raw
+--    readings would simply be gone. Tiering bronze is what makes "every layer
+--    lands in Iceberg" true — see docs/streamhouse-architecture.drawio.
+--
+--    `ptime` is a Flink computed column: virtual, never stored, so it does not
+--    reach the Iceberg schema.
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE iot_telemetry (
   `reading_id`      BIGINT,
@@ -40,9 +56,12 @@ CREATE TABLE iot_telemetry (
   `vibration`       DOUBLE,
   `signal_strength` INT,
   `ptime` AS PROCTIME()
+) WITH (
+  'table.datalake.enabled' = 'true',
+  'table.datalake.freshness' = '30s'
 );
 
--- Tiered as well, so StarRocks can read events from the cold tier in part D.
+-- Tiered for the same reason, so StarRocks reads events from the cold tier in part D.
 -- No PK, for the same union-read reason as the datalake_* tables below.
 -- The type-specific columns are sparse: only the ones belonging to a row's
 -- event_type are populated, exactly as they arrive on the topic.
