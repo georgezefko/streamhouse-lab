@@ -24,7 +24,6 @@ for ((i = 1; i <= ITERATIONS; i++)); do
   echo "$out"
 
   # sql-client exits 0 even when a statement fails, so grep for it. This is the runnable check.
-  # ponytail: does not parse the numbers themselves — to gate CI, also assert rows_only_in_hot > 0.
   if grep -q '\[ERROR\]' <<<"$out"; then
     echo "✗ SQL failed — is the stack up and the tiering job running?" >&2
     exit 1

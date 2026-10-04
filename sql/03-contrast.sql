@@ -29,11 +29,9 @@ LIMIT 3;
 
 -- 4) The operational question, answered off hot ∪ cold: which devices are running hot?
 SELECT device_id,
-       count(*)                        AS anomalies,
-       round(max(temperature), 1)      AS worst_temp,
-       sum(CASE WHEN vibration_spike THEN 1 ELSE 0 END) AS vib_spikes
+       count(*)                   AS anomalies,
+       round(max(temperature), 1) AS worst_temp
 FROM datalake_device_telemetry
 WHERE anomaly_flag
 GROUP BY device_id
-ORDER BY anomalies DESC
-LIMIT 5;
+ORDER BY anomalies DESC;

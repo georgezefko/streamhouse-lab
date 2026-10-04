@@ -128,9 +128,8 @@ def main():
     sent = 0
     # Pace against a wall-clock deadline rather than sleeping per message: at 50/s
     # a per-message sleep drifts badly on the OS timer granularity.
-    # ponytail: single-threaded json.dumps tops out somewhere around 20-50k msg/s. Falling
-    # short of RATE only means the topic grows more slowly. Shard across processes if you
-    # need more.
+    # Single-threaded json.dumps tops out around 20-50k msg/s; falling short of RATE only
+    # means the topic grows more slowly.
     started = time.monotonic()
     print(f"producing to {BROKERS}/{TOPIC} at {RATE}/s, {ROWS or 'unbounded'} readings", flush=True)
     while ROWS == 0 or sent < ROWS:

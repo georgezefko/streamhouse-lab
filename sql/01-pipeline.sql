@@ -6,22 +6,11 @@
 --                                                                               ├─▶ datalake_device_telemetry   (per reading)
 --                                                                               └─▶ datalake_device_health_1min (1-min window)
 --
--- Requires the topics to exist — start the producer first: `make produce`
--- (scripts/iot_producer.py), or point your own producer at iot-telemetry / iot-events with
--- the same field names and ISO-8601 timestamps.
---
--- Paste into an interactive session (`make sql`), AFTER sql/catalog.sql.
+-- Needs the topics to exist — `make produce` first. Paste into an interactive session
+-- (`make sql`), AFTER sql/catalog.sql.
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 1) The device dimension. A PK table: this is the lookup-join build side, where
---    the point lookups actually happen.
---
---    The ONE table here that is deliberately not tiered, and it loses nothing by it:
---    a PK table keeps the current row per key in a compacted KV store, and
---    'table.kv.ttl' has no default (row-level TTL off), so these 11 rows persist.
---    Only the changelog behind them is governed by 'table.log.ttl'. Tiering it would
---    break union read anyway — see the sort-merge note in docs/TUTORIAL.md.
--- ─────────────────────────────────────────────────────────────────────────────
+-- 1) The device dimension. The only PK table here (lookup-join build side) and the only
+--    untiered one — tiering a PK table breaks union read. See docs/NOTES.md.
 CREATE TABLE dim_device (
   `device_id`      STRING NOT NULL,
   `temp_threshold` DOUBLE,
@@ -31,22 +20,9 @@ CREATE TABLE dim_device (
   PRIMARY KEY (`device_id`) NOT ENFORCED
 );
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 2) The hot landing tables — BRONZE. Both LOG tables (no PK).
---    Reading a PK table in streaming mode emits -U/+U, and an append-only sink
---    rejects that. Everything downstream here is append-only, so these must be too.
---    See docs/TUTORIAL.md.
---
---    Both are TIERED. Without 'table.datalake.enabled' a table has no Iceberg
---    counterpart at all — no entry in Nessie, no Parquet in MinIO, no `$lake` to
---    query, and nothing outside Fluss can read it at any age. On top of that the
---    log segments age out at 'table.log.ttl' (7 days by default), so the raw
---    readings would simply be gone. Tiering bronze is what makes "every layer
---    lands in Iceberg" true — see docs/streamhouse-architecture.drawio.
---
---    `ptime` is a Flink computed column: virtual, never stored, so it does not
---    reach the Iceberg schema.
--- ─────────────────────────────────────────────────────────────────────────────
+-- 2) BRONZE — the topics as landed, nothing derived. Log tables (no PK), both tiered.
+--    Without 'table.datalake.enabled' there is no Iceberg twin and the log ages out at
+--    'table.log.ttl' (7 days). `ptime` is virtual — it never reaches the Iceberg schema.
 CREATE TABLE iot_telemetry (
   `reading_id`      BIGINT,
   `device_id`       STRING NOT NULL,
@@ -61,10 +37,8 @@ CREATE TABLE iot_telemetry (
   'table.datalake.freshness' = '30s'
 );
 
--- Tiered for the same reason, so StarRocks reads events from the cold tier in step 5.
--- No PK, for the same union-read reason as the datalake_* tables below.
--- The type-specific columns are sparse: only the ones belonging to a row's
--- event_type are populated, exactly as they arrive on the topic.
+-- The type-specific columns are sparse: only the ones belonging to a row's event_type
+-- are populated, exactly as they arrive on the topic.
 CREATE TABLE iot_events (
   `device_id`   STRING NOT NULL,
   `event_time`  TIMESTAMP(3),
@@ -83,22 +57,11 @@ CREATE TABLE iot_events (
   'table.datalake.freshness' = '30s'
 );
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 3) The tiered tables — THESE are the streamhouse tables.
---
---    NO PRIMARY KEY, deliberately. Union read (querying the bare table = hot ∪ cold)
---    merges the lake snapshot with the Fluss log; on a PK table that merge is a
---    sort-merge, which needs the lake reader to implement Fluss's SortedRecordReader.
---    fluss-lake-iceberg 0.9.1 does not, and the read dies with
---    "lake records must instance of sorted view". Log tables concatenate instead.
--- ─────────────────────────────────────────────────────────────────────────────
+-- 3) The derived tables. No PRIMARY KEY, deliberately: union read sort-merges a PK
+--    table and fluss-lake-iceberg 0.9.1 has no sorted reader. docs/NOTES.md.
 
--- Per-reading, enriched with the device's own threshold. Rows appear immediately,
--- which is what makes the hot-vs-cold contrast visible within seconds.
---
--- This is the grain a lambda pipeline would have had to publish onto a THIRD Kafka topic
--- and load into an OLAP store to make readable — a second copy, kept in sync by hand. Here
--- the row is queryable the instant it lands and tiers itself into Iceberg.
+-- SILVER — every reading, enriched with its device's own threshold and flagged. The flag is
+-- there as soon as the reading is, so this is the table to query during an incident.
 CREATE TABLE datalake_device_telemetry (
   `reading_id`      BIGINT,
   `device_id`       STRING NOT NULL,
@@ -118,15 +81,11 @@ CREATE TABLE datalake_device_telemetry (
   'table.datalake.freshness' = '30s'
 );
 
--- The analytical fact table — the reference pipeline's fact_telemetry_5min, at
--- tutorial time-scale. Dropped vs the original: cnt_events / events_* (needs a
--- stream-stream join) and the incomplete_by_* flags (need event time + watermarks).
--- ponytail: no event counts here; join iot_events at read time instead (sql/04-starrocks.sql).
---
--- cnt_anomalies is what carries the signal. anomaly_flag is the original's
--- max()>threshold rule, kept for parity, but over a full minute of readings the max
--- almost always clears the threshold — so it is TRUE for nearly every window and
--- ranks nothing. Rank on the anomaly RATE (cnt_anomalies / cnt_points) instead.
+-- GOLD — one row per device per minute; the table a dashboard reads. It trails the readings
+-- by up to a minute, because a window has to close before Flink can write it.
+-- cnt_anomalies carries the signal —
+-- anomaly_flag (max temp > threshold) is TRUE for nearly every window and ranks nothing,
+-- so rank on cnt_anomalies / cnt_points instead.
 CREATE TABLE datalake_device_health_1min (
   `device_id`        STRING NOT NULL,
   `window_start`     TIMESTAMP(3),
@@ -149,15 +108,12 @@ CREATE TABLE datalake_device_health_1min (
   'table.datalake.freshness' = '30s'
 );
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 4) Seed the dimension. dml-sync makes this block until it FINISHES, so the
---    lookup joins below never start against an empty dimension.
+-- 4) Seed the dimension. dml-sync blocks until it FINISHES, so the lookup joins below
+--    never start against an empty dimension.
 --
---    Thresholds are spread 24-29 °C across the 11 devices. The producer draws
---    temperature uniformly from 18-30 °C, so device_1 (24.0) sits over its
---    threshold about half the time and device_11 (29.0) about a twelfth — which is
---    what makes the part-D ranking come out ordered by threshold.
--- ─────────────────────────────────────────────────────────────────────────────
+--    Thresholds spread 24-29 °C over 11 devices; the producer draws temperature uniformly
+--    from 18-30 °C. So device_1 (24.0) sits over its threshold about half the time and
+--    device_11 (29.0) about a twelfth — that spread is what the rankings pick up.
 SET 'table.dml-sync' = 'true';
 
 INSERT INTO dim_device VALUES
@@ -176,15 +132,10 @@ INSERT INTO dim_device VALUES
 -- Back to detached: everything below should submit and return immediately.
 SET 'table.dml-sync' = 'false';
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 5) The Kafka sources. This is the seam: Fluss sits BEHIND the broker you already
---    have, it does not replace it.
+-- 5) The Kafka sources. Fluss sits behind the broker you already have.
 --
---    'earliest-offset' so re-running this picks up everything already produced.
---    'json.timestamp-format.standard' = 'ISO-8601' must match the producer — see the
---    note in scripts/iot_producer.py. 'json.ignore-parse-errors' keeps one malformed message from
---    killing the job, which is what you want against a real topic.
--- ─────────────────────────────────────────────────────────────────────────────
+--    'ISO-8601' must match the producer or every timestamp arrives NULL with no error.
+--    'earliest-offset' so a re-run picks up what is already on the topic.
 CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_telemetry` (
   `reading_id`      BIGINT,
   `device_id`       STRING,
@@ -228,11 +179,9 @@ CREATE TEMPORARY TABLE `default_catalog`.`default_database`.`src_events` (
   'json.ignore-parse-errors' = 'true'
 );
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 6) Land the topics in Fluss. ONE detached job with two sinks — an EXECUTE STATEMENT SET
---    compiles into a single JobGraph, which is why the Flink UI shows both sink names on one row.
---    From here on the data is indexed and queryable — which it was not on the topic.
--- ─────────────────────────────────────────────────────────────────────────────
+-- 6) The LANDING JOB: both topics into bronze, unchanged. ONE detached job with two sinks —
+--    a statement set compiles into a single JobGraph, which is why the Flink UI shows both
+--    sink names on one row.
 EXECUTE STATEMENT SET
 BEGIN
   INSERT INTO iot_telemetry
@@ -243,10 +192,10 @@ BEGIN
   SELECT * FROM `default_catalog`.`default_database`.src_events;
 END;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 7) Enrich once, consume twice. The lookup join is the point-lookup workload:
---    one PK read against dim_device per incoming reading.
--- ─────────────────────────────────────────────────────────────────────────────
+-- 7) The ENRICHMENT JOB, part one: the lookup join. For every reading Flink asks Fluss for
+--    one row — the device with that device_id — which a PK table answers from its key index,
+--    so Flink keeps no copy of the dimension. `t.ptime` is when the reading arrived, so each
+--    reading gets the threshold in the table at that moment.
 CREATE TEMPORARY VIEW `default_catalog`.`default_database`.`enriched` AS
 SELECT t.reading_id,
        t.device_id,
@@ -263,18 +212,14 @@ FROM fluss_catalog.fluss.iot_telemetry t
 LEFT JOIN fluss_catalog.fluss.dim_device FOR SYSTEM_TIME AS OF t.ptime AS d
   ON t.device_id = d.device_id;
 
--- ─────────────────────────────────────────────────────────────────────────────
--- 8) Derive both tiered tables. One more detached job, again two sinks off one enriched stream:
---    the per-reading table and the windowed aggregate read the same view, not each other.
+-- 8) The ENRICHMENT JOB, part two: silver and gold, two sinks off the one enriched view.
+--    Gold is computed from the enriched stream inside the job, not read back from silver.
 --
---    The window is PROCESSING time. A proctime tumble needs no watermark and emits
---    append-only, which is exactly what a log-table sink can consume. The reference
---    pipeline used event time because it simulated late data and outages; those are
---    out of scope here.
---    ponytail: proctime window; switch to event-time + WATERMARK when late data matters.
---
---    1 minute, not the original's 5 — so the fact table produces rows while you watch.
--- ─────────────────────────────────────────────────────────────────────────────
+--    PROCESSING-time window: a proctime tumble needs no watermark and emits append-only,
+--    which is what a log-table sink can consume. So a reading is counted in the minute it
+--    ARRIVED, not the minute on its own event_time — enough here, because readings arrive
+--    within a second. 1 minute, not 5, so rows appear while you watch. To group by the
+--    reading's own timestamp, see docs/NOTES.md "Switching to event-time windows".
 EXECUTE STATEMENT SET
 BEGIN
   INSERT INTO datalake_device_telemetry
@@ -316,5 +261,5 @@ BEGIN
   GROUP BY device_id, window_start, window_end;
 END;
 
--- Next:  make tiering     (step 3 — start moving hot -> cold)
+-- Next:  make tiering     (step 3 — start copying hot -> cold)
 -- Then:  sql/02-live.sql in this session, or `make demo` in another shell.

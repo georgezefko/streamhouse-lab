@@ -5,7 +5,7 @@
 # We use the NATIVE Nessie catalog (org.apache.iceberg.nessie.NessieCatalog), not Iceberg-REST.
 # Fluss bundles only iceberg-core catalogs; NessieCatalog lives in iceberg-nessie, so we add it
 # plus its nessie-client runtime deps. (Nessie's Iceberg-REST endpoint NPEs on createTable with
-# Fluss 0.9.1's Iceberg 1.10 client — see docs/TUTORIAL.md, "Use the native Nessie
+# Fluss 0.9.1's Iceberg 1.10 client — see docs/NOTES.md, "Use the native Nessie
 # catalog" — so the native catalog is the working path.)
 set -euo pipefail
 

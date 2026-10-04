@@ -116,7 +116,7 @@ services:
   coordinator-server:
     image: apache/fluss:0.9.1-incubating
     command: coordinatorServer
-    # ponytail: restart on boot race — Nessie (slow Quarkus boot) may not be serving :19120 yet
+    # restart on boot race — Nessie (slow Quarkus boot) may not be serving :19120 yet
     # when Fluss inits the Iceberg REST catalog. depends_on only waits for container start, not
     # app-ready, so the first attempt can hit connection-refused; on-failure retries until ready.
     restart: on-failure
@@ -156,7 +156,7 @@ services:
   tablet-server:
     image: apache/fluss:0.9.1-incubating
     command: tabletServer
-    restart: on-failure   # ponytail: same boot-race safety net as coordinator-server
+    restart: on-failure   # same boot-race safety net as coordinator-server
     depends_on:
       - coordinator-server
     environment:
