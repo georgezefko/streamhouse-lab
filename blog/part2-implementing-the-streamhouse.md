@@ -58,126 +58,158 @@ For each 1-minute window, we want to answer:
 - What operational events occurred in the same time frame — failures, maintenance, inspections,
   severity?
 
-The data pipeline architecture, and the technology at each step, is in the image below.
-
-![The streamhouse pipeline](docs/streamhouse-architecture.png)
-
 ## The architecture: who does what
 
-Same sensors, same Kafka topics, same StarRocks at the end. Ingestion and serving don't move.
-What changes is everything between them.
+```mermaid
+flowchart LR
+  S["Shop floor<br/>11 machines · 3 plants"]
+  K["Kafka<br/>iot-telemetry<br/>iot-events"]
+  J1["Flink · job 1<br/>land"]
+  FLUSS["FLUSS — hot tier<br/>iot_telemetry · iot_events · dim_device<br/>datalake_device_telemetry<br/>datalake_device_health_1min"]
+  J2["Flink · job 2<br/>enrich + 1-min tumble"]
+  ICE["Iceberg on MinIO — cold tier<br/>Nessie catalog · Parquet"]
+  SR["StarRocks<br/>dashboards"]
 
-- **Kafka** is the ingress. Two topics, `iot-telemetry` and `iot-events`, exactly as before. It
-  is a bus, not a place data lives.
-- **Flink 1.20** is the compute. All of it — landing, the lookup join, the window. There is no
-  second engine anywhere in this pipeline.
-- **Fluss** is the storage. Every step of the pipeline lands in a Fluss table, and every one of
-  those tables is queryable while the job writing it is still running.
-- **Tiering** is Fluss's own job, not mine. Each table is created with
-  `'table.datalake.freshness' = '30s'`, and a tiering service flushes it into **Iceberg on
-  MinIO**, catalogued by **Nessie**. I never write a sink, a compaction job or a catalog entry.
-- **StarRocks** reads the Iceberg side. It has no Fluss connector and does not know Fluss exists,
-  which is the point of the last demo.
+  S -->|"1 · JSON, 50/s"| K
+  K -->|"2 · read both topics"| J1
+  J1 -->|"3 · write"| FLUSS
+  FLUSS -->|"4 · streaming read + lookup join"| J2
+  J2 -->|"5 · write back"| FLUSS
+  FLUSS -->|"6 · tiering job, every 30s"| ICE
+  ICE -->|"7 · read"| SR
+```
 
-A tiered table has two names. `SELECT ... FROM datalake_device_telemetry` reads **hot ∪ cold** and
-answers now. `FROM datalake_device_telemetry$lake` reads **only** the Iceberg copy, as of the last
-flush. Tiered means copied, not moved: the row is in both places at once.
+Three components do the work, and it is worth being precise about which does what.
 
-The streamhouse puts storage where Kappa had job state. Flink still does the work, but each step
-lands in a table on the way through — the topics as they arrive, then every reading joined to its
-device's own temperature threshold with the anomaly flagged, then the one-minute window. Bronze,
-silver, gold, except none of them is a copy waiting for a batch job. They are the pipeline,
-written down and queryable while it runs.
+**Kafka** takes the readings in and does nothing else — edges 1 and 2. **Flink** does all of the
+compute: it reads both topics (2), enriches and flags each reading, and closes the one-minute
+windows (4). **Fluss** is the storage, and this is the part that makes it a streamhouse rather
+than a streaming job with a sink. Each Flink stage writes into a Fluss table instead of carrying
+its result forward as job state (3 and 5), and those tables are readable while the jobs are still
+writing to them. **StarRocks** sits at the end for dashboards (7).
 
-The window still earns its place, for cost rather than capability. It collapses a minute of
-readings per device into one row, so a dashboard reads thousands instead of millions. The
-difference is that when a question doesn't fit it, you drop to the per-reading table and ask
-there. In Kappa there was nothing to drop to.
+Edges 4 and 5 are the loop worth looking at twice: Flink reads a Fluss table *as a stream while
+job 1 is still writing it*, and writes the result straight back into the same store. That is the
+thing a topic cannot do.
 
-Events don't get a stage at all. They land, they tier, and the join to readings happens at read
-time, in whatever query needs it. Kappa had to decide that join in advance because the fact table
-was the only readable thing. Here events are readable the moment they arrive, so the join can
-wait for the question.
+Underneath, Fluss tiers itself (6). Every 30 seconds it flushes committed rows into Iceberg on
+MinIO, catalogued by Nessie — no sink to write, no compaction job to schedule, no second catalog
+to keep in sync. **Tiered means copied rather than moved**: a tiered table lives in both tiers at
+once, the Fluss log holding everything including the last few seconds, Iceberg holding everything
+up to the last flush. Both answer to one table name. Ask for `datalake_device_telemetry` and you
+get the union of hot and cold; ask for `datalake_device_telemetry$lake` and you get only what has
+been flushed. That difference is the whole experiment, and I come back to it later in the post.
 
-## Build it
+Five tables come out of this, and they fall into three groups.
+
+**Two are the topics landing unchanged.** `iot_telemetry`, one row per reading, and `iot_events`,
+one row per event with the type-specific columns arriving sparse and staying that way. Nothing is
+derived here. In a Kappa-style job this stage exists only as a deserialized record inside the job;
+here it is a table you can query.
+
+**One is a dimension.** `dim_device` holds the eleven devices and their temperature thresholds,
+keyed by `device_id`, and it is the build side of the lookup join — the only table in the pipeline
+that gets a primary key, for reasons I will come back to.
+
+**The last two are what Flink derives.** `datalake_device_telemetry` is every reading joined to
+its device's threshold with the anomaly flagged: one row in, one row out, no windowing, so the
+flag is available as soon as the reading is. This is the table I would actually query during an
+incident. `datalake_device_health_1min` is the fact table — one row per device per minute, with
+reading count, anomaly count, and average, min and max temperature.
+
+That window earns its place for cost rather than capability. It collapses a minute of readings
+per device into a single row, so a dashboard reads thousands of rows instead of millions. When a
+question does not fit the window, you drop to `datalake_device_telemetry` and ask there.
+
+Events get no derived stage at all. They land, they tier, and the join to readings happens at
+read time in whatever query needs it — because events are readable the moment they arrive, the
+join can wait for the question rather than being decided in advance.
+
+## Building it
 
 ```bash
-git clone <repo> && cd streamhouse-lab
-make up        # Flink, Fluss, Kafka, MinIO, Nessie, plus a liveness gate
-make produce   # 11 devices, 50 readings/s onto iot-telemetry, ~5 events/s onto iot-events
+make up        # Flink, Fluss, Nessie, MinIO, Kafka
+make produce   # 50 readings/s onto the two topics
+make sql       # Flink SQL client — paste catalog.sql, then 01-pipeline.sql
+make tiering   # start moving hot → cold
 ```
 
-The fleet is eleven machines across three plants. Each one has its own temperature threshold,
-spread from 24.0 to 29.0 °C, while the producer draws temperature uniformly from 18 to 30 °C.
-That detail matters later — it is what makes the final ranking mean something.
+Four commands from nothing to a running pipeline. The DDL, the gotchas and the step-by-step are
+all in the repo; what is worth walking through here is the three pieces that make it a
+streamhouse — how data gets in, what Flink does with it, and how the cold tier fills itself.
 
-**Step 1 — the dimension.** The one primary-key table in the pipeline, and the only one not
-tiered:
+### Ingestion
 
-```sql
-CREATE TABLE dim_device (
-  device_id STRING NOT NULL, temp_threshold DOUBLE, location_id STRING,
-  model STRING, status STRING,
-  PRIMARY KEY (device_id) NOT ENFORCED
-);
-```
+Kafka takes the readings and nothing else. The producer publishes JSON to `iot-telemetry` and
+`iot-events`, and the topics, the field names and the encoding are the whole contract — swap in
+any producer that writes the same shapes and nothing downstream changes.
 
-**Step 2 — land the topics.** Two log tables, tiered from birth:
+The first Flink job lands both topics into Fluss tables, unchanged. That is already the departure
+from Kappa: the raw reading is a row in a table you can query, not a deserialized record living
+inside a job.
 
-```sql
-CREATE TABLE iot_telemetry (
-  reading_id BIGINT, device_id STRING NOT NULL, event_time TIMESTAMP(3),
-  energy_usage DOUBLE, temperature DOUBLE, vibration DOUBLE, signal_strength INT,
-  ptime AS PROCTIME()
-) WITH (
-  'table.datalake.enabled' = 'true',
-  'table.datalake.freshness' = '30s'
-);
-```
+Eleven machines across three plants, each with its own temperature threshold spread from 24.0 to
+29.0 °C, while the producer draws temperature uniformly from 18 to 30 °C. That detail matters at
+the end — it is what makes the final ranking mean something rather than be a number I can't
+check.
 
-Those two properties are the entire tiering configuration. From here Fluss owns the cold copy.
+### The pipeline
 
-A Kafka source table feeds it, and one thing there is worth calling out because it fails
-silently: set `'json.timestamp-format.standard' = 'ISO-8601'`. Python's `datetime.isoformat()`
-writes `2026-09-09T19:21:03.81` with a `T`, Flink's JSON format defaults to `SQL` which expects a
-space, and you get NULL timestamps with no error anywhere.
-
-**Step 3 — enrich.** Flink reads `iot_telemetry` as a stream *while the landing job is still
-writing it*, and looks up each reading's own threshold:
+Flink reads what it just landed and enriches it:
 
 ```sql
-SELECT t.*, d.temp_threshold, d.location_id, d.model
-FROM iot_telemetry t
-LEFT JOIN dim_device FOR SYSTEM_TIME AS OF t.ptime AS d
+INSERT INTO datalake_device_telemetry
+SELECT t.device_id, t.event_time, t.temperature,
+       d.temp_threshold,
+       t.temperature > d.temp_threshold AS anomaly_flag
+FROM iot_telemetry AS t
+JOIN dim_device FOR SYSTEM_TIME AS OF t.ptime AS d
   ON t.device_id = d.device_id;
 ```
 
-That read-while-writing loop is the thing a topic cannot do, and it is why the flush that follows
-is a *copy*, not a handover.
+`FOR SYSTEM_TIME AS OF` makes it a lookup join — one point lookup against `dim_device` per
+incoming reading, rather than a second stream held in state. `dim_device` is the only primary-key
+table in the pipeline, and this is what the key is for.
 
-**Step 4 — the window.** A one-minute processing-time tumble per device into a second tiered
-table. One enriched stream feeds both sinks: per-reading detail and per-minute rollup, off a
-single read.
+The source is a Fluss table, the sink is a Fluss table, and the landing job is still writing the
+source while this one reads it. Edges 4 and 5 from the diagram, in one statement: the
+intermediate result is a real table, readable by anything, and it is also the input to the next
+stage.
 
-**Step 5 — turn tiering on.**
+That next stage is the one-minute window, a **processing-time** tumble. Which means a reading
+lands in whichever window was open when it arrived, not the one its own timestamp belongs to — a
+sensor that goes offline and dumps an hour of backlog would put all of it in one minute. Event
+time is a `WATERMARK` clause away; the repo says what else changes with it.
 
-```bash
-make tiering
+### Tiering
+
+Every tiered table carries two properties and nothing else:
+
+```sql
+'table.datalake.enabled'   = 'true',
+'table.datalake.freshness' = '30s'
 ```
 
-Two things will bite you here, and both cost me an evening.
+`enabled` gives the Fluss table an Iceberg twin; `freshness` sets how often committed rows are
+flushed into it. That is the entire configuration of the cold tier — no sink to write, no
+compaction job to schedule, no catalog registration, no second copy of the schema to keep in
+step. (What the DDL does *not* have is a primary key: union read on a tiered PK table is not
+implemented in `fluss-lake-iceberg` 0.9.1, which is why `dim_device` is the one table never
+tiered.)
 
-**Tiered tables have no primary key.** Querying the bare table merges the Iceberg snapshot with
-the Fluss log. On a PK table that merge is a sort-merge, which requires the lake reader to
-implement Fluss's `SortedRecordReader` — and `fluss-lake-iceberg-0.9.1` does not implement it
-anywhere. The read dies with `lake records must instance of sorted view`. Log tables concatenate
-instead, and work. Paimon implements it; Iceberg union read on PK tables is post-0.9.
+Two things about it are worth knowing, and both show up as the demo.
 
-**Append-only propagates backwards.** Reading a PK table in streaming mode emits `-U/+U`, and an
-append-only sink rejects it. So making the tiered table append-only forces its source to be
-append-only too. Same reason the window is processing time rather than event time: a proctime
-tumble needs no watermark and emits append-only, while an unbounded `GROUP BY` would emit a
-changelog the sink refuses.
+The Iceberg table appears in Nessie **at `CREATE TABLE`**, not when tiering starts — the Fluss
+coordinator registers an empty table and writes a metadata file to MinIO before a single row
+exists. And `make tiering` is a **separate step** from creating the tables and starting the jobs,
+so there is a window where the pipeline is live, readings are arriving, every table answers a
+query, and the lake side of every one of them is still empty. An empty `$lake` next to a live
+Nessie entry is the normal intermediate state, not a broken one.
+
+Run it, and everything is up: readings on Kafka, two jobs in Flink, five tables in Fluss, four of
+them growing an Iceberg copy in the background every thirty seconds. Which sets up the question
+the post opened with. If the hot tier really does answer *now* while the lake is a flush behind,
+that difference should be visible in a query. So let's look.
 
 ## Demo 1 — query the stream
 
