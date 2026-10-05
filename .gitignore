@@ -1,2 +1,4 @@
 lib/*.jar
 .claude/
+graphify-out/
+CLAUDE.md

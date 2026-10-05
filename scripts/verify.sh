@@ -101,8 +101,8 @@ else
   fail "Flink" "no taskmanager registered with jobmanager"
 fi
 
-# Kafka broker accepting API requests. Kafka is the ingress for Experiment 1 (sql/07 produces
-# onto iot-telemetry / iot-events), so a dead broker means the pipeline silently reads nothing.
+# Kafka broker accepting API requests. Kafka is the ingress (`make produce`
+# writes iot-telemetry / iot-events), so a dead broker means the pipeline silently reads nothing.
 kafka_ready() {
   $DC exec -T kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
     --bootstrap-server kafka:9092 >/dev/null 2>&1
@@ -110,7 +110,7 @@ kafka_ready() {
 if retry 60 kafka_ready; then
   pass "Kafka  ${DIM}:9092 (broker responding)${RESET}"
 else
-  fail "Kafka" ":9092 not accepting requests — Experiment 1 has no ingress"
+  fail "Kafka" ":9092 not accepting requests — the pipeline has no ingress"
 fi
 
 # ── 3. Buckets exist ───────────────────────────────────────────────────────────
@@ -121,9 +121,9 @@ for b in fluss warehouse; do
   if echo "$buckets" | grep -q "$b"; then pass "bucket '$b'"; else fail "bucket '$b'" "missing"; fi
 done
 
-# ── 4. StarRocks (only if the Experiment 3 overlay is running) ───────────────────
+# ── 4. StarRocks (only if the overlay is running) ────────────────────────────────
 if docker ps --format '{{.Names}}' | grep -q starrocks; then
-  info "StarRocks (Experiment 3)"
+  info "StarRocks (step 5)"
   if retry 60 curl -sf http://localhost:8030/api/health; then
     pass "StarRocks FE  ${DIM}:8030${RESET}"
   else

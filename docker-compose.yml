@@ -6,7 +6,7 @@
 #   minio -> minio-init (creates buckets) -> nessie + fluss servers -> flink
 #
 # NOTE: the Lakehouse Tiering Service is NOT a service here. It is a Flink job you launch
-# with scripts/start-tiering.sh once the stack is healthy (see docs/EXPERIMENTS.md, Experiment 1).
+# with scripts/start-tiering.sh once the stack is healthy (see docs/TUTORIAL.md).
 #
 # Iceberg plugin jars live in ./lib (run `make jars`). The native Nessie catalog + its deps go
 # BOTH on the Fluss servers (they create the Iceberg tables) AND on Flink (the tiering job writes
@@ -42,8 +42,8 @@ x-flink-iceberg-vols: &flink-iceberg-vols
   - ./lib/hadoop-client-runtime-3.3.6.jar:/opt/flink/lib/hadoop-client-runtime-3.3.6.jar
   - ./lib/failsafe-3.3.2.jar:/opt/flink/lib/failsafe-3.3.2.jar
   - ./lib/iceberg-flink-runtime-1.20-1.10.1.jar:/opt/flink/lib/iceberg-flink-runtime-1.20-1.10.1.jar
-  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # Experiments 1 and 4
-  - ./sql:/sql   # so `sql-client -f /sql/03-contrast.sql` can run non-interactively
+  - ./lib/flink-sql-connector-kafka-3.4.0-1.20.jar:/opt/flink/lib/flink-sql-connector-kafka-3.4.0-1.20.jar   # the Kafka ingress
+  - ./sql:/sql   # so `sql-client.sh -f /sql/03-contrast.sql` can run non-interactively
 
 services:
 
@@ -77,15 +77,17 @@ services:
   # ---------- Nessie: Iceberg catalog over MinIO ----------
   # Fluss uses the NATIVE Nessie catalog API at http://nessie:19120/api/v2 (ref=main), NOT the
   # Iceberg-REST endpoint (/iceberg/main) — REST createTable NPEs with Fluss's Iceberg 1.10 client.
-  # StarRocks (Experiment 3) still reads via Nessie's REST endpoint; reads are fine, only REST writes NPE.
-  # version.store IN_MEMORY = branch state is LOST on restart. Swap to ROCKSDB (see docs/EXPLANATION.md) if you
-  # want git-branch lifecycle demos to survive `docker compose down`.
+  # StarRocks (step 5) still reads via Nessie's REST endpoint; reads are fine, only REST writes NPE.
+  # version.store ROCKSDB on a named volume: the catalog — every table, every branch, every
+  # commit — survives a container restart. Branch history needs
+  # that; `make down` still wipes it with the volume, which is the intended full reset.
   nessie:
     image: ghcr.io/projectnessie/nessie:0.108.2
     ports:
       - "19120:19120"
     environment:
-      - nessie.version.store.type=IN_MEMORY
+      - nessie.version.store.type=ROCKSDB
+      - nessie.version.store.persist.rocks.database-path=/nessie/rocks
       - nessie.catalog.default-warehouse=warehouse
       - nessie.catalog.warehouses.warehouse.location=s3://warehouse/
       - nessie.catalog.service.s3.default-options.region=us-east-1
@@ -96,6 +98,11 @@ services:
       - nessie.catalog.secrets.access-key.name=admin
       - nessie.catalog.secrets.access-key.secret=password
       - nessie.server.authentication.enabled=false
+    # A named volume always mounts root-owned, and the image runs as uid 10000, so RocksDB
+    # cannot mkdir inside it. Run as root instead of adding a chown sidecar — it is a local lab.
+    user: "0:0"
+    volumes:
+      - nessie-data:/nessie
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -109,7 +116,7 @@ services:
   coordinator-server:
     image: apache/fluss:0.9.1-incubating
     command: coordinatorServer
-    # ponytail: restart on boot race — Nessie (slow Quarkus boot) may not be serving :19120 yet
+    # restart on boot race — Nessie (slow Quarkus boot) may not be serving :19120 yet
     # when Fluss inits the Iceberg REST catalog. depends_on only waits for container start, not
     # app-ready, so the first attempt can hit connection-refused; on-failure retries until ready.
     restart: on-failure
@@ -149,7 +156,7 @@ services:
   tablet-server:
     image: apache/fluss:0.9.1-incubating
     command: tabletServer
-    restart: on-failure   # ponytail: same boot-race safety net as coordinator-server
+    restart: on-failure   # same boot-race safety net as coordinator-server
     depends_on:
       - coordinator-server
     environment:
@@ -179,9 +186,9 @@ services:
         datalake.iceberg.client.region: us-east-1
     volumes: *fluss-iceberg-vols
 
-  # ---------- Kafka: ingress for Experiment 1, and the "you cannot query a log" contrast in Experiment 4 ----------
-  # Single-node KRaft, no ZooKeeper. Nothing else in the stack depends on it; it exists purely
-  # to hold the same volume of orders as Fluss so the point-lookup costs are comparable.
+  # ---------- Kafka: the ingress ----------
+  # Single-node KRaft, no ZooKeeper. The producer writes iot-telemetry / iot-events here and
+  # sql/01-pipeline.sql reads them; Fluss sits behind the broker, it does not replace it.
   kafka:
     image: apache/kafka:3.9.1
     ports:
@@ -199,9 +206,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
-  # Optional Python stand-in for the device fleet — the same two topics and the same
-  # JSON as sql/07-iot-produce.sql, for when the ingress should look like a real
-  # producer. Run this OR sql/07, not both.  `make produce`
+  # The device fleet — THE ingress.  `make produce`
   # No Dockerfile on purpose: this stays a compose lab with nothing to build.
   iot-producer:
     image: python:3.12-slim
@@ -263,3 +268,4 @@ services:
 
 volumes:
   minio-data:
+  nessie-data:
