@@ -6,8 +6,6 @@ Swap in any producer on the same topics with the same field names and nothing do
 changes.
 
   make produce      iot-telemetry + iot-events, 50 readings/s, 200k rows
-
-Ported from the Mage/lambda project's confluent-kafka generator.
 """
 import json
 import os
@@ -40,7 +38,7 @@ def now():
 
 def telemetry(device_id):
     # Temperature 18-30 C against dim_device's 24.0-29.0 thresholds, so the
-    # part-D ranking comes out ordered by threshold. Vibration spikes ~5%.
+    # device rankings come out ordered by threshold. Vibration spikes ~5%.
     return {
         "reading_id": random.randint(1, ID_MAX),
         "device_id": device_id,

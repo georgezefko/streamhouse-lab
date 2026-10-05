@@ -99,13 +99,13 @@ why the Flink UI shows names like `insert-into_...datalake_device_telemetry,flus
 - *`Table sink ... doesn't support consuming update and delete changes`* — a PK table is feeding
   an append-only sink. Everything downstream of `iot_telemetry` must be append-only.
   [Why](NOTES.md#a-log-table-sink-cannot-consume-a-pk-tables-changelog).
-- *`temp_threshold` all NULL* — the seed did not finish before the derive jobs started.
+- *`temp_threshold` all NULL* — the seed did not finish before the enrichment job started.
   `sql/01-pipeline.sql` uses `SET 'table.dml-sync' = 'true'` around it; if you pasted out of
   order, re-run the seed.
 - *every `event_time` NULL, everything else populated* — a JSON timestamp-format mismatch.
   [Why](NOTES.md#json-timestamps-on-kafka-need-iso-8601).
 - *zero rows, jobs RUNNING* — nothing is on the topic. Run step 1 first.
-- *`datalake_device_health_1min` stays empty past 2 minutes* — check the second derive job's
+- *`datalake_device_health_1min` stays empty past 2 minutes* — check the enrichment job's
   *Exceptions* tab in the Flink UI.
 
 ---
@@ -167,7 +167,8 @@ shows a permanent gap; a windowed aggregate does not.
 - *`cold_only` stuck at 0* — the tiering job is not running.
 - *`Batch mode can only be supported if one lake snapshot exists`* — nothing tiered yet. Wait
   ~30 s after `make tiering`.
-- *`lake records must instance of sorted view`* — a tiered table has a PRIMARY KEY.
+- *`lake records must instance of sorted view`* — a batch read of a tiered table that has a
+  PRIMARY KEY.
   [Why that is fatal](NOTES.md#union-read-requires-log-tables).
 - *`Trying to access closed classloader`* — Hadoop's static `FileSystem` cache pins the user
   classloader. Disabled via `classloader.check-leaked-classloader: false` in

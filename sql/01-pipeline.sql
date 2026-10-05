@@ -10,7 +10,8 @@
 -- (`make sql`), AFTER sql/catalog.sql.
 
 -- 1) The device dimension. The only PK table here (lookup-join build side) and the only
---    untiered one — tiering a PK table breaks union read. See docs/NOTES.md.
+--    untiered one — in 0.9.1 a tiered PK table cannot be batch-read by its bare name.
+--    See docs/NOTES.md.
 CREATE TABLE dim_device (
   `device_id`      STRING NOT NULL,
   `temp_threshold` DOUBLE,
@@ -57,8 +58,8 @@ CREATE TABLE iot_events (
   'table.datalake.freshness' = '30s'
 );
 
--- 3) The derived tables. No PRIMARY KEY, deliberately: union read sort-merges a PK
---    table and fluss-lake-iceberg 0.9.1 has no sorted reader. docs/NOTES.md.
+-- 3) The derived tables. No PRIMARY KEY, deliberately: a batch union read sort-merges a
+--    PK table and fluss-lake-iceberg 0.9.1 has no sorted reader. docs/NOTES.md.
 
 -- SILVER — every reading, enriched with its device's own threshold and flagged. The flag is
 -- there as soon as the reading is, so this is the table to query during an incident.

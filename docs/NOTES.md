@@ -11,9 +11,10 @@ first.
 
 ### Union read requires log tables
 
-Querying the bare table (hot ∪ cold) merges the lake snapshot with the Fluss log. On a PK table
-that merge is a **sort-merge**, so Fluss's `LakeSnapshotAndLogSplitScanner` requires the lake
-reader to implement `org.apache.fluss.lake.source.SortedRecordReader`.
+Fluss can tier a primary-key table to Iceberg. What fails in 0.9.1 is the **batch** read of
+its bare name (hot ∪ cold). That read merges the lake snapshot with the Fluss log by key, a
+**sort-merge**, so Fluss's `LakeSnapshotAndLogSplitScanner` requires the lake reader to
+implement `org.apache.fluss.lake.source.SortedRecordReader`.
 `fluss-lake-iceberg-0.9.1-incubating` does not implement it anywhere — verified by unpacking
 the jar. The read fails with:
 
@@ -25,8 +26,11 @@ Log tables concatenate rather than merge, so they union-read fine. This is why e
 table here — `iot_telemetry`, `iot_events`, `datalake_device_telemetry`,
 `datalake_device_health_1min` — has **no primary key**.
 
-Paimon's reader does implement the interface. Iceberg union read on PK tables is a post-0.9
-roadmap item.
+Paimon's reader does implement the interface. For Iceberg, Fluss's own tests cover a tiered
+PK table read as a stream and through `$lake`, in 0.9.1 and in 1.0; neither is exercised in
+this lab. The 1.0 docs list PK union read as supported in both batch and streaming mode, but
+the 1.0 Iceberg module still ships no sorted reader, so check the batch case before relying
+on it after an upgrade.
 
 ### A log-table sink cannot consume a PK table's changelog
 
@@ -265,6 +269,11 @@ not.
 Every flush is an Iceberg commit that adds small Parquet files, so a tiered table accumulates
 them exactly like any Iceberg table fed by a stream, and wants compaction and snapshot expiry.
 Neither is set up here — the lab is short-lived.
+
+Fluss has a table option for the first, `'table.datalake.auto-compaction' = 'true'`, which
+makes the tiering service compact as it writes. It is off by default and left off here. Note
+for upgrades: in Fluss 1.0 the option is a no-op for newly created Iceberg tables and only
+applies to tables created by earlier versions, so 1.0 needs external Iceberg compaction.
 
 What the streamhouse changes is who pays for the fix. Because Flink reads the newest rows from
 the hot tier, `table.datalake.freshness` can be raised to minutes without making Flink queries
